@@ -34,6 +34,7 @@ import mimetypes
 import pathlib
 import sys
 import time
+import uuid
 
 import httpx
 
@@ -193,7 +194,10 @@ def publish(path: pathlib.Path) -> str:
         aws_access_key_id=need("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=need("AWS_SECRET_ACCESS_KEY"),
     )
-    key = f"{ENV.get('S3_PREFIX', 'castrol/')}prototype/{int(time.time())}_{path.name}"
+    # The uuid is load-bearing: named by the second alone, runs started together
+    # overwrote each other's inputs, and five paid renders got the same plate.
+    key = (f"{ENV.get('S3_PREFIX', 'castrol/')}prototype/"
+           f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{path.name}")
     ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     s3.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": ctype})
     # 1 hour is the documented presign life elsewhere in the stack; the video

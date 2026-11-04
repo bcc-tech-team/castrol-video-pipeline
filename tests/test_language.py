@@ -307,6 +307,23 @@ class TestIntake:
         assert isinstance(result, ValidRow)
         assert result.language == "ta"
 
+    @pytest.mark.parametrize("column", ["Language", "LANGUAGE", " language "])
+    def test_the_column_is_found_whatever_its_capitalisation(self, column):
+        # batch2.csv sent `Language`. A miss here is silent: absent means Hindi.
+        result = validate_row(good_row(**{column: "Telugu"}))
+        assert isinstance(result, ValidRow)
+        assert result.language == "te"
+
+    def test_an_exact_match_wins_over_a_case_variant(self):
+        result = validate_row(good_row(language="Tamil", Language="Telugu"))
+        assert isinstance(result, ValidRow)
+        assert result.language == "ta"
+
+    def test_an_unknown_value_in_a_capitalised_column_is_still_rejected(self):
+        result = validate_row(good_row(Language="Odia"))
+        assert isinstance(result, Rejection)
+        assert result.code == RejectCode.LANGUAGE_UNSUPPORTED
+
     def test_an_unknown_language_is_rejected(self):
         result = validate_row(good_row(language="Odia"))
         assert isinstance(result, Rejection)

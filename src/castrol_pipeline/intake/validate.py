@@ -137,6 +137,22 @@ def looks_like_test_row(name: str | None, phone_e164: str | None) -> bool:
     return False
 
 
+def _column_value(row: dict[str, Any], name: str) -> Any:
+    """Read a column whatever its capitalisation, exact spelling first.
+
+    For the language column only, because here a miss is SILENT: absent means
+    Hindi. batch2 sent `Language` against the configured `language`, which would
+    have voiced every mechanic in Hindi with no error anywhere.
+    """
+    if name in row:
+        return row[name]
+    wanted = name.strip().casefold()
+    for key, value in row.items():
+        if isinstance(key, str) and key.strip().casefold() == wanted:
+            return value
+    return None
+
+
 def validate_row(
     row: dict[str, Any], *, language_column: str = "language"
 ) -> ValidRow | Rejection:
@@ -215,7 +231,7 @@ def validate_row(
     # Absent or blank is Hindi. Present and unknown is a rejection, not Hindi:
     # a default here would voice a Tamil mechanic's video in the wrong language.
     try:
-        language = resolve_language(row.get(language_column))
+        language = resolve_language(_column_value(row, language_column))
     except UnknownLanguage as exc:
         return Rejection(RejectCode.LANGUAGE_UNSUPPORTED, str(exc))
 
