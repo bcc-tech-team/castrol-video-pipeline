@@ -92,10 +92,17 @@
 
 body {
   margin: 0;
-  /* The shell is a column so the footer can be pushed to the bottom of a short
-     page (`.foot { margin-top: auto }`) rather than floating under a two-row
-     table with the background running on below it. */
-  min-height: 100dvh;
+  /* The shell is a column of EXACTLY the viewport, and it is the <main> inside
+     it that scrolls - not the document. Changed 2026-11-13.
+     .scroll used to be capped at min(72dvh, 840px), a fraction of the viewport
+     picked without counting the ~400px of header, page heading, filters, pager
+     and footer around it. At 1920x900 the table box ran past the bottom of the
+     window, so the pager sat off-screen - and because the wheel is captured by
+     the table's own scroller, nothing on screen hinted there was more below.
+     With the height fixed here, `.sheet` can hand the table whatever is left
+     over and the pager and footer are always in view. */
+  height: 100dvh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -220,7 +227,13 @@ header.top .who button { padding: 3px var(--s2); font-size: var(--t-sm); }
 
 main {
   flex: 1;
-  padding: var(--s5);
+  /* min-height:0 lets this shrink inside the column instead of being forced to
+     its content height, which is what makes the overflow below actually bite.
+     Pages that are genuinely taller than the window (Usage) scroll HERE, so
+     the header and footer stay put rather than scrolling away. */
+  min-height: 0;
+  overflow: auto;
+  padding: var(--s4) var(--s5) var(--s5);
   padding-left: max(var(--s5), env(safe-area-inset-left));
   padding-right: max(var(--s5), env(safe-area-inset-right));
   padding-bottom: max(var(--s7), env(safe-area-inset-bottom));
@@ -243,7 +256,7 @@ main {
   align-items: baseline;
   gap: var(--s3);
   flex-wrap: wrap;
-  margin-bottom: var(--s5);
+  margin-bottom: var(--s4);
 }
 h1 {
   font-family: var(--font-display);
@@ -265,6 +278,32 @@ h2 {
   text-wrap: balance;
 }
 p { text-wrap: pretty; }
+
+/* ---- one-screen pages ------------------------------------------------------
+   The table pages (Jobs, Failures, Submissions) wrap their content in .sheet.
+   It is exactly the height of <main>, so the table inside it gets the space
+   left after the heading, the filters and the pager - no guessed fraction of
+   the viewport, no pager pushed off the bottom, and the number of rows on
+   screen follows the window instead of being a number someone chose.
+
+   flex: 0 1 auto on the table, NOT flex: 1 - it may shrink to fit but must not
+   GROW. A three-row Failures page should be three rows tall, not a short table
+   stretched down the window with empty box under it.
+
+   min-height on the table is the floor: below it the sheet overflows and main
+   scrolls, which is the honest outcome on a very short window - better than
+   two rows in a sliver. */
+.sheet {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.sheet > .scroll {
+  flex: 0 1 auto;
+  min-height: 140px;
+  max-height: none;
+}
 
 /* ---- tables ----------------------------------------------------------------
    .scroll is a real scroll region in both axes, which is what lets the header
@@ -780,6 +819,10 @@ dialog h2 { margin: 0 0 var(--s1); font-size: var(--t-lg); color: var(--fg); let
   main { padding: var(--s4); }
   .ranges { margin-left: 0; }
   .scroll { max-height: none; }
+  /* On a phone the table is read by scrolling the page, not by squeezing it
+     into a sliver between the filters and the pager. */
+  .sheet { height: auto; }
+  .sheet > .scroll { flex: 0 0 auto; min-height: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

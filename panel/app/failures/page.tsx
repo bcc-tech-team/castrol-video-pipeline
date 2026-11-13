@@ -37,8 +37,10 @@ export default async function Failures({
 function FailuresPending() {
   return (
     <Loading>
-      <PageHead title="Failures" meta={<Bar width="160px" />} />
-      <SkeletonRows cols={8} rows={8} />
+      <div className="sheet">
+        <PageHead title="Failures" meta={<Bar width="160px" />} />
+        <SkeletonRows cols={8} rows={8} />
+      </div>
     </Loading>
   );
 }
@@ -113,7 +115,7 @@ async function FailuresTable({ page }: { page: number }) {
   const pages = pageCount(total);
 
   return (
-    <>
+    <div className="sheet">
       <PageHead
         title="Failures"
         meta={
@@ -177,6 +179,6 @@ async function FailuresTable({ page }: { page: number }) {
       </div>
 
       <Pager path="/failures" params={{}} page={page} total={total} label="Failures" />
-    </>
+    </div>
   );
 }

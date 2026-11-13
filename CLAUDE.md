@@ -536,10 +536,36 @@ for 711px of content; 759px with the one line. It is not needed for the sticky
 header - `relative` neither helps nor harms that - so nothing else in the file
 explains why it is there.
 
-**The shell is a flex column and ends in a `.foot`.** `body` is
-`min-height: 100dvh` with `main { flex: 1 }`, so the footer's `margin-top: auto`
-puts it at the bottom of the window on a three-row Failures page instead of
-half way up it. It exists because a table that simply stops, with the ground
+**The shell is EXACTLY one viewport and the document never scrolls - `main`
+does.** Changed 2026-11-13; `body` was `min-height: 100dvh` and is now
+`height: 100dvh; overflow: hidden`, with `main { flex: 1; min-height: 0;
+overflow: auto }`. `min-height: 0` is the load-bearing half: without it a flex
+item is floored at its content height and the overflow never bites.
+
+The bug this fixes: `.scroll` was capped at `min(72dvh, 840px)`, a fraction of
+the viewport chosen without counting the ~400px of header, heading, filters,
+pager and footer around it. At 1920x900 the box ran past the bottom of the
+window, so the pager was off-screen - and because the wheel is captured by the
+table's own scroller, nothing on screen suggested there was anything below it.
+
+**Jobs, Failures and Submissions wrap their content in `.sheet`**, which is
+`height: 100%` of `main`, so the table gets whatever is left after the heading,
+the filters and the pager. The rows on screen now follow the window - 26 at
+1400px tall, 14 at 900, 10 on a 1366x768 laptop, 7 at 650 - instead of being a
+number someone picked. Measured at each of those: the document does not scroll,
+and the pager and footer are always in view.
+
+`.sheet > .scroll` is `flex: 0 1 auto`, NOT `flex: 1`: it may shrink to fit but
+must never grow, or a three-row Failures page becomes a short table stretched
+down the window with an empty box under it (verified - a 153px table gets a
+155px box). Its `min-height: 140px` is the floor; below that the sheet overflows
+and `main` scrolls, which beats two rows in a sliver. Under 720px `.sheet` goes
+back to `height: auto` and the table lays out full length, because a phone reads
+a table by scrolling, not by squeezing it between the filters and the pager.
+
+Usage has no `.sheet` and is not affected - it is genuinely taller than the
+window and scrolls inside `main`. The footer's `margin-top: auto` still puts it
+at the bottom on a three-row Failures page instead of half way up it. It exists because a table that simply stops, with the ground
 colour running on below it, reads as a page that failed to finish loading. It
 says only things true on every page and every row, which is why it names the
 campaign and the timezone and nothing else - it is rendered for a signed-in

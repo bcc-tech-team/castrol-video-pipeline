@@ -35,8 +35,10 @@ export default async function Submissions({
 function SubmissionsPending() {
   return (
     <Loading>
-      <PageHead title="Submissions" meta={<Bar width="260px" />} />
-      <SkeletonRows cols={10} />
+      <div className="sheet">
+        <PageHead title="Submissions" meta={<Bar width="260px" />} />
+        <SkeletonRows cols={10} />
+      </div>
     </Loading>
   );
 }
@@ -94,7 +96,7 @@ async function SubmissionsTable({ page }: { page: number }) {
   const pages = pageCount(total);
 
   return (
-    <>
+    <div className="sheet">
       <PageHead
         title="Submissions"
         meta={
@@ -172,6 +174,6 @@ async function SubmissionsTable({ page }: { page: number }) {
       </div>
 
       <Pager path="/submissions" params={{}} page={page} total={total} label="Submissions" />
-    </>
+    </div>
   );
 }

@@ -55,9 +55,13 @@ export default async function Jobs({
 function JobsPending({ q, range }: { q: string; range: RangeKey }) {
   return (
     <Loading>
-      <PageHead title="Jobs" meta={<Bar width="220px" />} />
-      <Filters action="/" q={q} range={range} />
-      <SkeletonRows cols={8} />
+      {/* .sheet here too, so the skeleton occupies the same box the table will
+          and the page does not jump when it arrives. */}
+      <div className="sheet">
+        <PageHead title="Jobs" meta={<Bar width="220px" />} />
+        <Filters action="/" q={q} range={range} />
+        <SkeletonRows cols={8} />
+      </div>
     </Loading>
   );
 }
@@ -169,7 +173,10 @@ async function JobsTable({ q, range, page }: { q: string; range: RangeKey; page:
   const total = rowsQ.count ?? rows.length;
   const pages = pageCount(total);
   return (
-    <>
+    // .sheet is exactly <main>'s height, so the table below gets the space left
+    // after the heading, the filters and the pager - the pager is never pushed
+    // off the bottom of the window.
+    <div className="sheet">
       <PageHead
         title="Jobs"
         meta={
@@ -271,7 +278,7 @@ async function JobsTable({ q, range, page }: { q: string; range: RangeKey; page:
       )}
 
       <Pager path="/" params={params} page={page} total={total} label="Jobs" />
-    </>
+    </div>
   );
 }
 
