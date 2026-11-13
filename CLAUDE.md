@@ -550,9 +550,12 @@ table's own scroller, nothing on screen suggested there was anything below it.
 
 **Jobs, Failures and Submissions wrap their content in `.sheet`**, which is
 `height: 100%` of `main`, so the table gets whatever is left after the heading,
-the filters and the pager. The rows on screen now follow the window - 26 at
-1400px tall, 14 at 900, 10 on a 1366x768 laptop, 7 at 650 - instead of being a
-number someone picked. Measured at each of those: the document does not scroll,
+the filters and the pager. The rows on screen now follow the window - 19 at
+1080px tall, 15 at 900, 11 on a 1366x768 laptop - instead of being a number
+someone picked. `main`'s bottom padding is `s3`, not the `s7` it carried before
+the footer existed: 48px of air above the footer's own rule and padding was
+that gap twice over, and on a `.sheet` page it was 36px of table given away for
+nothing. Reclaiming it is worth one more row at every height. Measured at each of those: the document does not scroll,
 and the pager and footer are always in view.
 
 `.sheet > .scroll` is `flex: 0 1 auto`, NOT `flex: 1`: it may shrink to fit but

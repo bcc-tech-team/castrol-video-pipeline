@@ -236,7 +236,11 @@ main {
   padding: var(--s4) var(--s5) var(--s5);
   padding-left: max(var(--s5), env(safe-area-inset-left));
   padding-right: max(var(--s5), env(safe-area-inset-right));
-  padding-bottom: max(var(--s7), env(safe-area-inset-bottom));
+  /* s3, not s7. The 48px here predates the footer, when the page just stopped
+     and needed air under it. The footer now supplies the end - its own top
+     rule plus s4 of padding - so s7 was that gap twice over, and on a .sheet
+     page it was 36px of table taken for nothing. */
+  padding-bottom: max(var(--s3), env(safe-area-inset-bottom));
 }
 /* main used to stop at max-width:1400px, which on a 1920 screen left a band of
    dead ground down the right while the sticky header ran edge to edge - the
@@ -581,7 +585,7 @@ a.btn { text-decoration: none; display: inline-block; }
   justify-content: space-between;
   flex-wrap: wrap;
   gap: var(--s2) var(--s4);
-  margin-top: var(--s3);
+  margin-top: var(--s2);
   font-size: var(--t-sm);
   font-variant-numeric: tabular-nums;
 }
