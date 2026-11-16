@@ -874,6 +874,17 @@ Each step that writes to production or spends needs an explicit go-ahead.
 8. When the client adds the export column, set `EXPORT_LANGUAGE_COLUMN` to its
    name. Until then the default, `language`, is what is read.
 
+### Odia (`or`) — added and APPROVED 2026-11-16
+
+The client's copy, in as `v1` (there is no draft of ours), `tts_language="or"`.
+The copy arrived with its slot markers in Telugu script, mapped by meaning to
+`{name}` / `{workshop}` / `{locality}`. Approved the same day after one
+audio take (Raju Shetty / Shetty Motors / Andheri, Mumbai; 25.5s, ~$0.02) was
+heard and accepted, so it is live: the first Odia export row renders for a
+real mechanic. The take was checked for the slot case endings, which the copy
+sets off with a space (`{workshop} ରୁ`, `{locality} ରେ`), and the Odia digit
+`୮`. Lipsync on the video model is untested in Odia, as in the other five.
+
 ### Adding a language later
 
 1. Add `Language(code="mr", name="Marathi", aliases=("marathi", "मराठी"),

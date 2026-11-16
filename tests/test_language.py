@@ -75,8 +75,14 @@ def _ctx(**over) -> JobContext:
 
 
 class TestRegistry:
-    def test_the_six_languages_this_release_ships(self):
-        assert set(SUPPORTED_LANGUAGES) == {"hi", "ta", "te", "kn", "bn", "ml"}
+    def test_the_languages_this_release_ships(self):
+        assert set(SUPPORTED_LANGUAGES) == {"hi", "ta", "te", "kn", "bn", "ml", "or"}
+
+    def test_odia_is_live_on_the_clients_copy(self):
+        odia = get_language("or")
+        assert odia.approved is True
+        assert current_version("or") == "v1"
+        assert odia.tts_language == "or"
 
     @pytest.mark.parametrize("lang", LANGUAGES, ids=lambda lang: lang.code)
     def test_every_template_fills_all_three_slots_and_nothing_else(self, lang):
@@ -99,11 +105,12 @@ class TestRegistry:
         assert 2 <= len(lang.code) <= 3 and lang.code.isascii()
         assert lang.code.isalpha() and lang.code.islower()
 
-    def test_all_six_are_approved(self):
-        # Approved 2026-10-30 after the audio test. A language added later
+    def test_all_seven_are_approved(self):
+        # Five approved 2026-10-30, Odia 2026-11-16, each after its audio
+        # take. A language added later
         # starts False and does not belong in this list until it is heard.
         assert {lang.code for lang in LANGUAGES if lang.approved} == {
-            "hi", "ta", "te", "kn", "bn", "ml",
+            "hi", "ta", "te", "kn", "bn", "ml", "or",
         }
 
     @pytest.mark.parametrize("code", ["ta", "te", "kn", "bn", "ml"])
@@ -127,7 +134,8 @@ class TestResolve:
             ("Kannada", "kn"), ("ಕನ್ನಡ", "kn"), ("Bengali", "bn"),
             ("Bangla", "bn"), ("বাংলা", "bn"), ("Malayalam", "ml"),
             ("മലയാളം", "ml"), ("Hindi", "hi"), ("Hinglish", "hi"),
-            ("हिंदी", "hi"),
+            ("हिंदी", "hi"), ("Odia", "or"), ("Oriya", "or"),
+            ("ଓଡ଼ିଆ", "or"), ("ଓଡ଼ିଆ", "or"),
         ],
     )
     def test_every_spelling_resolves(self, raw, code):
@@ -137,7 +145,7 @@ class TestResolve:
     def test_blank_is_hindi(self, raw):
         assert resolve_language(raw) == "hi"
 
-    @pytest.mark.parametrize("raw", ["Odia", "or", "French", "tam"])
+    @pytest.mark.parametrize("raw", ["Marathi", "mr", "French", "tam"])
     def test_unknown_raises_rather_than_defaulting(self, raw):
         with pytest.raises(UnknownLanguage):
             resolve_language(raw)
@@ -320,12 +328,12 @@ class TestIntake:
         assert result.language == "ta"
 
     def test_an_unknown_value_in_a_capitalised_column_is_still_rejected(self):
-        result = validate_row(good_row(Language="Odia"))
+        result = validate_row(good_row(Language="Marathi"))
         assert isinstance(result, Rejection)
         assert result.code == RejectCode.LANGUAGE_UNSUPPORTED
 
     def test_an_unknown_language_is_rejected(self):
-        result = validate_row(good_row(language="Odia"))
+        result = validate_row(good_row(language="Marathi"))
         assert isinstance(result, Rejection)
         assert result.code == RejectCode.LANGUAGE_UNSUPPORTED
 
