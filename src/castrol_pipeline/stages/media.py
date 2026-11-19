@@ -367,11 +367,27 @@ def composite(video: Path, card: Path, out: Path) -> Path:
     because checks are logged rather than blocking. Trimming makes the check
     mean what it says.
 
-    -crf 16 / veryslow: the overlay is a static graphic over an already
-    compressed source, so the re-encode must be visually lossless or it throws
-    away quality we paid the avatar model for. ffmpeg's default crf 23 cut the
+    -crf 16: the overlay is a static graphic over an already compressed
+    source, so the re-encode must be visually lossless or it throws away
+    quality we paid the avatar model for. ffmpeg's default crf 23 cut the
     bitrate from 4.59 to 1.19 Mbps here, which is very visible on the card
-    edges and on skin gradients.
+    edges and on skin gradients. CRF is the quality knob; keep it at 16.
+
+    -preset medium, NOT veryslow - measured 2026-11-19, not assumed. This step
+    was the batch bottleneck on the 2-vCPU worker, ~149s a video at veryslow.
+    On three Batch 2 renders, the same command pinned to one SMT core (the
+    t3.medium's shape) and scaled to each job's real worker time:
+
+        preset     worker s   VMAF    card-band SSIM   size
+        veryslow     149     97.57       0.99930        7.7 MB
+        medium        35     97.58       0.99934        8.4 MB
+        fast          28     97.51       0.99930        8.2 MB
+        veryfast      13     96.91       0.99850        7.1 MB
+
+    Medium is 4.3x faster with VMAF and card-edge SSIM equal to veryslow, and
+    card text and beard texture were identical at 2x zoom. The cost is ~8%
+    larger files. veryfast is where loss first shows up (-0.66 VMAF, and SSIM
+    drops on the card text), so do not go past fast without measuring again.
     """
     speech = audio_stream_duration_seconds(video)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video), "-i", str(card),
@@ -387,7 +403,7 @@ def composite(video: Path, card: Path, out: Path) -> Path:
             note="could not read the audio stream; shipping the full video "
                  "including any silent tail",
         )
-    cmd += ["-c:v", "libx264", "-crf", "16", "-preset", "veryslow",
+    cmd += ["-c:v", "libx264", "-crf", "16", "-preset", "medium",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             "-c:a", "copy", str(out)]
     _run(cmd, "composite overlay")
