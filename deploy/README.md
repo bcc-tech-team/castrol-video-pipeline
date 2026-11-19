@@ -492,6 +492,13 @@ Note the unit *mounts* `.env` rather than passing `--env-file`: Docker's
 `--env-file` parser does not strip quotes, so `KEY="value"` would arrive with
 the quotes attached.
 
+### 8. Keep automatic upgrades off docker
+
+**Do this before the first long batch.** Without it, Ubuntu's own security
+updates restart docker under a running cycle and end it. That happened on
+2026-11-18. The three files and the reasons are in
+[Automatic upgrades](#automatic-upgrades).
+
 ### Upgrading
 
 **Nothing to do.** Merge to `main`, let CI go green, and the next cycle pulls
@@ -809,6 +816,173 @@ sudo systemctl enable --now castrol-cycle.timer
 
 ---
 
+## Automatic upgrades
+
+**An unattended upgrade must never restart docker while a cycle is running.**
+On 2026-11-18 one did, and a 100-video batch died 40 minutes in. 30 renders
+were left `running` at the vendor, one run was stuck in `claimed`, and 69 had
+never been submitted.
+
+Here is how it happens. docker on this box is Ubuntu's `docker.io`, so its
+security updates come through `noble-security` with everything else. There are
+two ways an upgrade restarts `docker.service`:
+
+1. **A docker, containerd or runc upgrade.** The package's own postinst
+   restarts the daemon.
+2. **Any library upgrade, through needrestart.** After every apt run,
+   needrestart restarts services that still map an old copy of a library that
+   was just replaced. On 24.04 it does this without asking when nobody is at a
+   terminal. dockerd links libc and libsystemd, so a routine libc6, openssl or
+   systemd update restarts docker without any docker package changing.
+
+Both castrol units declare `Requires=docker.service`. systemd passes a restart
+of docker on to them as a stop and then a start, so the container goes down
+with the daemon. On a `--bg` unit the start then failed on "container name
+already in use", because the stop's `docker stop` could not reach a daemon that
+was going down. `deploy/castrol` now removes a leftover container first.
+
+### The fix: three files
+
+Copy these from `deploy/` to the instance, the same way as the units:
+
+| file in `deploy/` | installed as | what it does |
+|---|---|---|
+| `51castrol-unattended-upgrades` | `/etc/apt/apt.conf.d/51castrol-unattended-upgrades` | blacklists `docker.io`, `containerd`, `runc`. Every other package still updates on its own. Also states `Automatic-Reboot "false"` |
+| `needrestart-castrol.conf` | `/etc/needrestart/conf.d/castrol.conf` | needrestart never restarts docker, containerd or any `castrol*` unit by itself |
+| `apt-daily-upgrade-castrol.conf` | `/etc/systemd/system/apt-daily-upgrade.timer.d/castrol.conf` | moves unattended upgrades to 10:30-11:00 IST, the one window no timer cycle can be in |
+
+```bash
+sudo install -m 644 51castrol-unattended-upgrades /etc/apt/apt.conf.d/51castrol-unattended-upgrades
+```
+
+```bash
+sudo install -d /etc/needrestart/conf.d && sudo install -m 644 needrestart-castrol.conf /etc/needrestart/conf.d/castrol.conf
+```
+
+```bash
+sudo install -d /etc/systemd/system/apt-daily-upgrade.timer.d && sudo install -m 644 apt-daily-upgrade-castrol.conf /etc/systemd/system/apt-daily-upgrade.timer.d/castrol.conf
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+And reinstall the `castrol` command, which now carries the pre-clean:
+
+```bash
+sudo install -m 755 castrol /usr/local/bin/castrol
+```
+
+The first two files are the real fix. The timer is a second line of defence
+and cannot be the only one: a cycle someone started by hand with
+`castrol --bg cycle` or `castrol --bg run` can be running at any hour.
+
+Why not the alternatives:
+
+- **`apt-mark hold docker.io`** stops the upgrade but does nothing about
+  needrestart, which is the more frequent cause. It also blocks a by-hand
+  `apt-get upgrade`, so the patch gets forgotten.
+- **Turning unattended-upgrades off** leaves the whole box unpatched to protect
+  one daemon.
+- **docker's `live-restore`** keeps containers alive across a daemon restart,
+  but the `docker run` client that systemd owns still loses its connection and
+  exits. The unit stops anyway, and its ExecStopPost then stops the container.
+
+### Check it took
+
+```bash
+apt-config dump | grep -A4 'Unattended-Upgrade::Package-Blacklist'
+```
+
+```bash
+sudo unattended-upgrade --dry-run --debug 2>&1 | grep -iE 'blacklist|docker|containerd|runc'
+```
+
+```bash
+sudo needrestart -v -r l 2>&1 | head -20
+```
+
+needrestart evaluates `conf.d` as Perl. A typo shows up as an error in that
+output, not silently.
+
+```bash
+systemctl list-timers 'apt-daily*'
+```
+
+`apt-daily-upgrade.timer` should show its next run between 05:00 and 05:30 UTC,
+which is 10:30-11:00 IST.
+
+### Patching docker by hand
+
+The blacklist means docker's security updates wait for a person. Check for
+them weekly, and install them only when no castrol unit is running:
+
+```bash
+apt list --upgradable 2>/dev/null | grep -E '^(docker\.io|containerd|runc)/'
+```
+
+```bash
+systemctl list-units --all 'castrol-*' && sudo docker ps --filter name=castrol
+```
+
+Both should show nothing running. Then:
+
+```bash
+sudo apt-get update && sudo apt-get install --only-upgrade docker.io containerd runc
+```
+
+Then restart whatever needrestart held back, while nothing is running:
+
+```bash
+sudo needrestart -r a
+```
+
+### Confirming what happened on a past date
+
+To tell which of the two causes it was:
+
+```bash
+grep -E -B2 -A6 'docker|containerd|runc' /var/log/apt/history.log
+```
+
+```bash
+sudo grep -E 'Packages that will be upgraded|docker|containerd|runc|needrestart' /var/log/unattended-upgrades/unattended-upgrades.log
+```
+
+```bash
+journalctl --since '2026-11-18 09:45' --until '2026-11-18 10:10' -u apt-daily-upgrade -u docker -u containerd -o short-iso
+```
+
+A `docker.io` line in `history.log` at that time is cause 1. A libc6, openssl
+or systemd line with no docker package is cause 2.
+
+### A lock left behind by a killed cycle
+
+A cycle killed outright (SIGKILL, a dead network) cannot release its advisory
+lock. The server only notices the session is gone when TCP gives up on it,
+which can take a long time behind the session pooler. Until then every new
+cycle logs `cycle.skipped` with `reason=lock_held` and exits 0, which looks
+like a healthy run with nothing to do.
+
+If a cycle is skipped while `docker ps` shows no castrol container, find the
+holder (the namespace is `db.ADVISORY_LOCK_NAMESPACE`, `0x63617374`; the cycle's
+key is 1):
+
+```sql
+SELECT a.pid, a.client_addr, a.backend_start, a.state_change
+  FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+ WHERE l.locktype = 'advisory' AND l.classid = 1667330932 AND l.objid = 1;
+```
+
+Then end that session, which releases the lock. Do this only after confirming
+no cycle is running anywhere:
+
+```sql
+SELECT pg_terminate_backend(<pid>);
+```
+
+---
+
 ## After a restart
 
 Nothing needs doing. The pipeline keeps no state outside Postgres: readiness is
@@ -886,12 +1060,32 @@ not going to run a CLI.
 
 ### Exit codes
 
-| code | meaning |
-|---|---|
-| 0 | ran clean, or skipped because another cycle held the lock |
-| 1 | the export pull failed, **or** the deadline was reached with work outstanding |
+| code | meaning | event |
+|---|---|---|
+| 0 | ran clean, or skipped because another cycle held the lock | `cycle.done` / `cycle.skipped` |
+| 1 | the export pull failed, **or** the deadline was reached with work outstanding | `cycle.intake_failed` / `cycle.deadline`, then `cycle.done` |
+| 75 | the database connection was lost mid-run | `cycle.db_lost` |
+| 143 | a SIGTERM stopped it between steps: `systemctl stop`, `docker stop`, a docker restart | `cycle.interrupted` |
 
-Neither loses work. Alert on `systemctl --failed` containing `castrol-cycle`.
+None of these loses work. Alert on `systemctl --failed` containing `castrol-cycle`.
+
+**Every cycle that takes the lock writes `cycle.start` and exactly one of
+`cycle.done`, `cycle.db_lost` or `cycle.interrupted`.** So a `cycle.start` with
+nothing after it means the process was killed outright, with no chance to say
+so:
+
+```sql
+SELECT event, level, fields, created_at FROM job_events
+ WHERE event LIKE 'cycle.%' ORDER BY created_at DESC LIMIT 20;
+```
+
+`cycle.db_lost` goes to journald first. Its database row is a best effort and
+lands only if the pool has a working connection again by the time it is written.
+
+The SIGTERM is caught and checked between steps, never in the middle of one. An
+exception thrown between a paid submit and the write that records its task id
+would lose that task (invariant 13). If a step outlasts docker's stop grace
+period, the container is SIGKILLed exactly as it was before.
 
 ---
 

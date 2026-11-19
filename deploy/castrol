@@ -93,9 +93,18 @@ if [ "$bg" = 1 ]; then
     # not sit through the default 90s first - the container is being killed
     # either way, and killing it loses nothing, because readiness is recomputed
     # from stage_runs on the next run.
+    #
+    # ExecStartPre is for a RESTART. Requires=docker.service passes a docker
+    # restart on to this unit as a stop and then a start. The stop's
+    # ExecStopPost cannot reach a daemon that is going down, so the old
+    # container can still be there when the start comes. Without this line
+    # that start died on "container name ... already in use", seen on
+    # 2026-11-18 when an unattended upgrade restarted docker. The castrol
+    # timer unit has had the same pre-clean since its first reboot.
     sudo systemd-run --unit="$unit" --uid=castrol --gid=castrol --collect \
         --property=After=docker.service --property=Requires=docker.service \
         --property=TimeoutStopSec=30 \
+        --property="ExecStartPre=-/usr/bin/docker rm -f $unit" \
         --property="ExecStopPost=-/usr/bin/docker stop -t 30 $unit" \
         /usr/bin/docker run --rm --pull "$PULL" --name "$unit" \
             --volume "$ENV_FILE:/app/.env:ro" \

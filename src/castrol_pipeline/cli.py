@@ -133,8 +133,10 @@ def cycle(
 
     EXIT CODES: 0 normally, including a clean run that found nothing to do.
     1 if the export pull failed, or if the deadline was reached with work still
-    outstanding. Neither loses anything — readiness is recomputed, so the next
-    cycle resumes — but both are worth waking up for.
+    outstanding. 75 if the database connection was lost mid-run. 143 if a
+    SIGTERM stopped it between steps. None of these loses anything —
+    readiness is recomputed, so the next cycle resumes — but all are worth
+    waking up for.
     """
     _boot()
     from .cycle import run_cycle
@@ -146,8 +148,28 @@ def cycle(
         fetch=not no_fetch,
     )
     typer.echo(json.dumps(out, indent=2, default=str))
+    raise typer.Exit(cycle_exit_code(out))
+
+
+#: EX_TEMPFAIL from sysexits.h: a temporary failure, try again later.
+EXIT_DB_LOST = 75
+#: 128 + SIGTERM, the code a shell reports for a process a SIGTERM ended.
+EXIT_INTERRUPTED = 143
+
+
+def cycle_exit_code(out: dict) -> int:
+    """The exit code for one cycle's summary. The most serious cause wins.
+
+    A lost database comes first because it explains the others: a cycle that
+    lost its database also stopped early with work left.
+    """
+    if out.get("db_lost"):
+        return EXIT_DB_LOST
+    if out.get("interrupted"):
+        return EXIT_INTERRUPTED
     if out.get("intake_error") or out.get("deadline_hit"):
-        raise typer.Exit(1)
+        return 1
+    return 0
 
 
 @app.command("seed-job")

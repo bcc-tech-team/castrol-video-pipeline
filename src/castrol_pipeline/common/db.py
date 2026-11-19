@@ -59,6 +59,20 @@ def connection() -> Iterator[psycopg.Connection]:
 #: with one taken by anything else sharing the database. Arbitrary constant.
 ADVISORY_LOCK_NAMESPACE = 0x6361_7374  # "cast"
 
+#: libpq options for the advisory-lock connection, which sits idle for up to
+#: the cycle's whole 8h deadline. Keepalives stop that idle connection being
+#: dropped silently in between, and `tcp_user_timeout` puts a ceiling on how
+#: long a write to a dead peer can block. Without it the unlock on 2026-11-18
+#: waited out the kernel's retransmission timeout, about 15 minutes, before
+#: raising "SSL SYSCALL error: Connection timed out".
+LOCK_CONNECT_KWARGS: dict[str, Any] = {
+    "keepalives": 1,
+    "keepalives_idle": 60,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 60_000,  # ms
+}
+
 
 @contextmanager
 def advisory_lock(key: int) -> Iterator[bool]:
@@ -70,9 +84,16 @@ def advisory_lock(key: int) -> Iterator[bool]:
     nothing in the calling code can see. This opens its own connection and
     holds it for the whole block, which makes the lock last exactly as long as
     the work it guards, and releases it if the process is killed.
+
+    **The unlock never raises.** If the connection is already dead, the session
+    is gone or going, and the lock goes with it. There is nothing to release.
+    Raising from this `finally` did real damage on 2026-11-18. It replaced the
+    error that actually ended the cycle, so the traceback named the unlock and
+    not the cause, and it skipped everything the caller had left to do.
     """
     dsn = get_settings().require("supabase_db_url")
-    with psycopg.connect(dsn, autocommit=True, row_factory=dict_row) as conn:
+    conn = psycopg.connect(dsn, autocommit=True, row_factory=dict_row, **LOCK_CONNECT_KWARGS)
+    try:
         row = conn.execute(
             "SELECT pg_try_advisory_lock(%s, %s) AS got;",
             (ADVISORY_LOCK_NAMESPACE, key),
@@ -82,10 +103,32 @@ def advisory_lock(key: int) -> Iterator[bool]:
             yield got
         finally:
             if got:
-                conn.execute(
-                    "SELECT pg_advisory_unlock(%s, %s);",
-                    (ADVISORY_LOCK_NAMESPACE, key),
-                )
+                _release_advisory_lock(conn, key)
+    finally:
+        _close_quietly(conn)
+
+
+def _release_advisory_lock(conn: psycopg.Connection, key: int) -> None:
+    if conn.closed:
+        log.warning("db.advisory_unlock_skipped", key=key, reason="connection closed")
+        return
+    try:
+        conn.execute(
+            "SELECT pg_advisory_unlock(%s, %s);",
+            (ADVISORY_LOCK_NAMESPACE, key),
+        )
+    except psycopg.Error as exc:
+        # The lock belongs to the session. If the session cannot answer, the
+        # server ends it, and a lock nobody can reach cannot block anyone
+        # once that has happened.
+        log.warning("db.advisory_unlock_failed", key=key, error=str(exc)[:300])
+
+
+def _close_quietly(conn: psycopg.Connection) -> None:
+    try:
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - closing a dead socket is not news
+        log.warning("db.lock_connection_close_failed", error=str(exc)[:300])
 
 
 @contextmanager

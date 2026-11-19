@@ -1,0 +1,28 @@
+// Castrol worker: unattended-upgrades must never restart the container
+// runtime underneath a running cycle.
+//
+// Install as /etc/apt/apt.conf.d/51castrol-unattended-upgrades. It sorts after
+// Ubuntu's own 50unattended-upgrades, and apt appends list entries across
+// files, so this adds to the stock blacklist without editing it.
+//
+// Why: docker on this box is Ubuntu's `docker.io`, so its security updates
+// arrive through noble-security like any other package. The package's
+// postinst restarts docker.service. Both castrol units declare
+// Requires=docker.service, so the restart is passed on to them as a stop.
+// On 2026-11-18 that killed a 100-video batch 40 minutes in.
+//
+// These three are patched BY HAND, between cycles. See deploy/README.md,
+// "Automatic upgrades". Everything else keeps updating on its own.
+//
+// Entries are regular expressions matched against the package name.
+
+Unattended-Upgrade::Package-Blacklist {
+    "docker.io$";
+    "containerd$";
+    "runc$";
+};
+
+// Stated, not assumed. A kernel update must never reboot the box on its own
+// clock. A reboot mid-batch is survivable (OnBootSec resumes it), but it is
+// a choice for a person to make between cycles.
+Unattended-Upgrade::Automatic-Reboot "false";

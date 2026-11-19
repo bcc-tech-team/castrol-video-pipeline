@@ -48,10 +48,16 @@ property that makes it safe to run this unattended at all.
 
 from __future__ import annotations
 
+import signal
+import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import psycopg
 
 from .common import db
 from .common.events import record_event
@@ -70,6 +76,47 @@ CYCLE_LOCK_KEY = 1
 #: run has a known due time and could be slept to exactly, but waking up
 #: periodically keeps the log showing a live process.
 MAX_SLEEP_S = 300
+
+#: What "the database went away" looks like from here. `PoolTimeout`, raised
+#: when the pool cannot hand out a connection, subclasses `OperationalError`,
+#: so a pool that has given up and a socket that timed out are both covered.
+#: `InterfaceError` covers using a connection psycopg has already closed.
+DB_LOST_ERRORS: tuple[type[BaseException], ...] = (
+    psycopg.OperationalError,
+    psycopg.InterfaceError,
+)
+
+
+@contextmanager
+def _stop_on_sigterm() -> Iterator[threading.Event]:
+    """Turn SIGTERM into a flag that the wait loop checks between steps.
+
+    In the container the cycle is PID 1, and the kernel does not apply the
+    default action to a signal sent to PID 1. With no handler, `docker stop`
+    and a daemon restart deliver a SIGTERM that does nothing, and the process
+    is SIGKILLed when the grace period runs out. That leaves no end event and
+    no unlock. A flag, and not an exception, because an exception raised
+    between a paid submit and the write that records its task id would lose
+    the task (invariant 13). The flag is only checked where nothing is in
+    flight.
+
+    Only installed from the main thread, which is the only place Python allows
+    it. Anything else, a test runner thread for example, gets a flag that
+    never fires.
+    """
+    stop = threading.Event()
+    if threading.current_thread() is not threading.main_thread():
+        yield stop
+        return
+
+    def handler(signum: int, _frame: object) -> None:
+        stop.set()
+
+    previous = signal.signal(signal.SIGTERM, handler)
+    try:
+        yield stop
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def intake_window(lookback_days: int, *, today: date | None = None) -> tuple[date, date]:
@@ -333,13 +380,15 @@ def run_cycle(
     interval_s: int = 60,
     fetch: bool = True,
 ) -> dict[str, Any]:
-    """Pull, then work until everything is terminal or the deadline is reached."""
-    from .intake.runner import run_intake
-    from .orchestrator import drain_stage, poll_once, reap
+    """Pull, then work until everything is terminal or the deadline is reached.
 
+    Every cycle that takes the lock ends in exactly one durable event:
+    `cycle.done`, `cycle.interrupted` or `cycle.db_lost`. `cycle.deadline`
+    comes before a `cycle.done`. So a `cycle.start` with nothing after it
+    means the process was killed outright.
+    """
     started_at = datetime.now(UTC)
     clock_start = time.monotonic()
-    deadline = clock_start + deadline_minutes * 60
 
     summary: dict[str, Any] = {
         "started_at": started_at,
@@ -349,7 +398,7 @@ def run_cycle(
         "stage_runs": {},
     }
 
-    with db.advisory_lock(CYCLE_LOCK_KEY) as acquired:
+    with _stop_on_sigterm() as stop, db.advisory_lock(CYCLE_LOCK_KEY) as acquired:
         if not acquired:
             # Not an error. The previous cycle is still rendering, which on a
             # large batch is the expected state, and the work it is doing is
@@ -358,77 +407,141 @@ def run_cycle(
             record_event("cycle.skipped", level="warning", reason="lock_held")
             return {**summary, "skipped": True, "reason": "another cycle holds the lock"}
 
-        # Before intake, not at the first schedule: a real cycle over rehearsal
-        # data would otherwise pull and dedupe first, and only then refuse.
-        from .orchestrator import _checked_mode
-
-        summary["stage_mode"] = _checked_mode()
-        log.info("cycle.start", deadline_minutes=deadline_minutes, fetch=fetch,
-                 stage_mode=summary["stage_mode"])
-
-        if fetch:
-            from_date, to_date = intake_window(lookback_days)
-            summary["window"] = [str(from_date), str(to_date)]
-            try:
-                counters = run_intake(from_date=from_date, to_date=to_date)
-                summary["intake"] = counters.as_dict()
-            except Exception as exc:  # noqa: BLE001 - the cycle is the boundary
-                # A dead export API is not a reason to abandon the jobs already
-                # in the database. Yesterday's renders still need finishing;
-                # the non-zero exit is what makes the failed pull visible.
-                summary["intake_error"] = str(exc)[:500]
-                log.error("cycle.intake_failed", error=str(exc))
-                record_event("cycle.intake_failed", level="error", error=str(exc)[:500])
-
-        summary["repaired"] = _repair_orphans()
-        summary["redelivering"] = len(_reopen_suppressed_deliveries())
-        summary["scheduled"] = _schedule_all()
-
-        totals: dict[str, int] = summary["stage_runs"]
-        while True:
-            summary["passes"] += 1
-            reap()
-
-            for stage in DEFAULT_PLAN:
-                n = drain_stage(stage)
-                if n:
-                    totals[str(stage)] = totals.get(str(stage), 0) + n
-
-            completed = poll_once()
-            if completed:
-                totals["poll"] = totals.get("poll", 0) + completed
-
-            left = outstanding_work()
-            log.info("cycle.pass", pass_no=summary["passes"], **{
-                k: v for k, v in left.items() if k != "next_due"
-            })
-            if left["total"] == 0:
-                break
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # Not a failure of any job — everything is still queued and the
-                # next cycle resumes it. It IS a signal that a batch is taking
-                # longer than the gap between runs, which is worth waking up for.
-                summary["deadline_hit"] = True
-                summary["outstanding"] = {k: left[k] for k in ("queued", "in_flight")}
-                log.warning("cycle.deadline", **summary["outstanding"])
-                record_event("cycle.deadline", level="warning", **summary["outstanding"])
-                break
-
-            time.sleep(next_sleep(left, interval_s, remaining))
-
-        summary["elapsed_s"] = round(time.monotonic() - clock_start, 1)
-        summary["jobs"] = {
-            r["status"]: r["n"]
-            for r in db.fetch_all("SELECT status, count(*) AS n FROM jobs GROUP BY status;")
-        }
-        log.info("cycle.done", **{k: summary[k] for k in ("passes", "elapsed_s", "jobs")})
-        record_event(
-            "cycle.done",
-            passes=summary["passes"],
-            elapsed_s=summary["elapsed_s"],
-            deadline_hit=summary["deadline_hit"],
-        )
+        try:
+            _work(summary, stop=stop, lookback_days=lookback_days,
+                  deadline_minutes=deadline_minutes, interval_s=interval_s,
+                  fetch=fetch, clock_start=clock_start)
+        except DB_LOST_ERRORS as exc:
+            # The cycle cannot do anything useful without its database, and
+            # nothing is lost by stopping here. Readiness is recomputed from
+            # `stage_runs`, a render already submitted keeps going at the
+            # vendor, and the reaper returns a stranded claim to the queue.
+            # What matters is that the failure is named, here and in the exit
+            # code, and not left to the unlock to report as something else.
+            summary["db_lost"] = f"{type(exc).__name__}: {str(exc)[:400]}"
+            summary["elapsed_s"] = round(time.monotonic() - clock_start, 1)
+            # The journal is the record that survives here. The event insert
+            # is a best effort, and it lands only if the pool has a working
+            # connection again by now. record_event swallows its own failure.
+            record_event(
+                "cycle.db_lost",
+                level="error",
+                error=summary["db_lost"],
+                passes=summary["passes"],
+                elapsed_s=summary["elapsed_s"],
+            )
 
     return summary
+
+
+def _work(
+    summary: dict[str, Any],
+    *,
+    stop: threading.Event,
+    lookback_days: int,
+    deadline_minutes: int,
+    interval_s: int,
+    fetch: bool,
+    clock_start: float,
+) -> None:
+    """Everything the cycle does while it holds the lock. Fills in `summary`."""
+    from .intake.runner import run_intake
+    from .orchestrator import _checked_mode, drain_stage, poll_once, reap
+
+    deadline = clock_start + deadline_minutes * 60
+
+    # Before intake, not at the first schedule: a real cycle over rehearsal
+    # data would otherwise pull and dedupe first, and only then refuse.
+    summary["stage_mode"] = _checked_mode()
+    record_event("cycle.start", deadline_minutes=deadline_minutes, fetch=fetch,
+                 stage_mode=summary["stage_mode"])
+
+    if fetch:
+        from_date, to_date = intake_window(lookback_days)
+        summary["window"] = [str(from_date), str(to_date)]
+        try:
+            counters = run_intake(from_date=from_date, to_date=to_date)
+            summary["intake"] = counters.as_dict()
+        except DB_LOST_ERRORS:
+            # Not the export API's fault. Let the cycle boundary report it
+            # as what it is.
+            raise
+        except Exception as exc:  # noqa: BLE001 - the cycle is the boundary
+            # A dead export API is not a reason to abandon the jobs already
+            # in the database. Yesterday's renders still need finishing;
+            # the non-zero exit is what makes the failed pull visible.
+            summary["intake_error"] = str(exc)[:500]
+            log.error("cycle.intake_failed", error=str(exc))
+            record_event("cycle.intake_failed", level="error", error=str(exc)[:500])
+
+    summary["repaired"] = _repair_orphans()
+    summary["redelivering"] = len(_reopen_suppressed_deliveries())
+    summary["scheduled"] = _schedule_all()
+
+    totals: dict[str, int] = summary["stage_runs"]
+    while not stop.is_set():
+        summary["passes"] += 1
+        reap()
+
+        for stage in DEFAULT_PLAN:
+            if stop.is_set():
+                break
+            n = drain_stage(stage)
+            if n:
+                totals[str(stage)] = totals.get(str(stage), 0) + n
+        if stop.is_set():
+            break
+
+        completed = poll_once()
+        if completed:
+            totals["poll"] = totals.get("poll", 0) + completed
+
+        left = outstanding_work()
+        log.info("cycle.pass", pass_no=summary["passes"], **{
+            k: v for k, v in left.items() if k != "next_due"
+        })
+        if left["total"] == 0:
+            break
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # Not a failure of any job — everything is still queued and the
+            # next cycle resumes it. It IS a signal that a batch is taking
+            # longer than the gap between runs, which is worth waking up for.
+            summary["deadline_hit"] = True
+            summary["outstanding"] = {k: left[k] for k in ("queued", "in_flight")}
+            log.warning("cycle.deadline", **summary["outstanding"])
+            record_event("cycle.deadline", level="warning", **summary["outstanding"])
+            break
+
+        # An Event wait and not time.sleep, so that a SIGTERM ends the wait
+        # at once and not up to MAX_SLEEP_S later.
+        stop.wait(next_sleep(left, interval_s, remaining))
+
+    summary["elapsed_s"] = round(time.monotonic() - clock_start, 1)
+    if stop.is_set():
+        # Something stopped the cycle from outside: `systemctl stop`, `docker
+        # stop`, or a docker restart during an upgrade. Nothing is lost, for
+        # the same reasons a deadline loses nothing. The event is what tells a
+        # stopped batch apart from a finished one.
+        summary["interrupted"] = "SIGTERM"
+        record_event(
+            "cycle.interrupted",
+            level="warning",
+            signal="SIGTERM",
+            passes=summary["passes"],
+            elapsed_s=summary["elapsed_s"],
+        )
+        return
+
+    summary["jobs"] = {
+        r["status"]: r["n"]
+        for r in db.fetch_all("SELECT status, count(*) AS n FROM jobs GROUP BY status;")
+    }
+    log.info("cycle.done", **{k: summary[k] for k in ("passes", "elapsed_s", "jobs")})
+    record_event(
+        "cycle.done",
+        passes=summary["passes"],
+        elapsed_s=summary["elapsed_s"],
+        deadline_hit=summary["deadline_hit"],
+    )
