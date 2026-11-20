@@ -44,6 +44,11 @@ class StageErrorCode(StrEnum):
     #: WITHOUT spending an attempt and closes that provider's limiter for a
     #: few seconds. It never fails a run and never reaches `retry_delay_for`.
     VENDOR_THROTTLED = "VENDOR_THROTTLED"
+    #: The provider account has no credits left (402 / "Credits insufficient").
+    #: Like a throttle it never fails a run: the run goes back without
+    #: spending an attempt and every submit to that provider pauses until the
+    #: balance covers the queue again (common/health.py).
+    VENDOR_OUT_OF_CREDITS = "VENDOR_OUT_OF_CREDITS"
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     ASSET_MISSING = "ASSET_MISSING"
     FFMPEG_FAILED = "FFMPEG_FAILED"
@@ -85,7 +90,9 @@ class StageErrorCode(StrEnum):
 #: renders to "500 internal error, please try again later" in three bursts,
 #: every one terminal, and the panel told the client each PHOTO had been
 #: rejected. The provider's own message says to try again; the retry policy now
-#: does, up to STAGE_MAX_ATTEMPTS behind the usual backoff.
+#: does, on its own long budget (`orchestrator.unavailable_delay`), and once
+#: that is spent the failure releases itself later up to a lifetime cap
+#: (`orchestrator.failure_decision`, invariant 34).
 TERMINAL_STAGE_ERRORS: frozenset[StageErrorCode] = frozenset(
     {
         StageErrorCode.BUDGET_EXHAUSTED,
@@ -136,6 +143,12 @@ class VendorThrottled(PipelineError):
     (invariant 13 is about a submit that MAY have landed; this one did not)."""
 
     code = StageErrorCode.VENDOR_THROTTLED
+
+
+class VendorOutOfCredits(PipelineError):
+    """The account cannot pay for this call. Refused before anything was made."""
+
+    code = StageErrorCode.VENDOR_OUT_OF_CREDITS
 
 
 class AssetMissing(PipelineError):

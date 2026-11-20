@@ -159,9 +159,17 @@ uv run castrol retry-failed --stage video
 ```
 
 A provider-side **5xx** on a video task is now `VENDOR_UNAVAILABLE`, which the
-retry policy retries (up to `STAGE_MAX_ATTEMPTS`), instead of `VENDOR_REJECTED`,
-which it does not — and which the panel read out as a rejected photo.
+retry policy retries, instead of `VENDOR_REJECTED`, which it does not — and
+which the panel read out as a rejected photo.
 → [`stages/vendors.py:video_task_failure`](src/castrol_pipeline/stages/vendors.py)
+
+**Since 2026-11-20 `retry-failed` should rarely be needed for those.**
+`VENDOR_UNAVAILABLE` has its own budget — 12 attempts at 1, 2, 4, 8, 15, then
+30 minutes, 3.5 hours of backoff — and when that runs out the failure releases
+ITSELF 30 minutes later, until the attempts summed over every run at those
+inputs reach 24 (invariant 34). Each release is a `job.auto_retry` event;
+hitting the cap is `job.attempt_cap_reached`, and that job is the one to look
+at. → [`orchestrator.py:failure_decision`](src/castrol_pipeline/orchestrator.py)
 
 **The rehearsal** - `STAGE_MODE=mock`: real export, real free stages, only
 audio/image/video faked, failures injected by `MOCK_FAILURES`, nothing spent or
@@ -769,6 +777,8 @@ rules, not application code.
 | Stage protocol + the DAG | [`stages/base.py`](src/castrol_pipeline/stages/base.py) |
 | Anything that talks to a provider | [`stages/vendors.py`](src/castrol_pipeline/stages/vendors.py) |
 | Request limiter per provider, in-flight caps | [`common/pacing.py`](src/castrol_pipeline/common/pacing.py) |
+| Outage pause, credits pause, per provider | [`common/health.py`](src/castrol_pipeline/common/health.py) |
+| Which failures release themselves, and when | [`orchestrator.py:failure_decision`](src/castrol_pipeline/orchestrator.py) |
 | Anything local and free — **the card**, ffmpeg, ffprobe | [`stages/media.py`](src/castrol_pipeline/stages/media.py) |
 | No-spend doubles (`USE_STUB_STAGES=true`) | [`stages/stubs.py`](src/castrol_pipeline/stages/stubs.py) |
 | **The only path to a paid vendor** | [`common/budget.py`](src/castrol_pipeline/common/budget.py) |
@@ -1313,11 +1323,26 @@ meant nothing: a content-safety rejection would resubmit the same inputs inside
 one `drain_stage` until its limit, and `BUDGET_EXHAUSTED` would hot-loop against
 the cap. It never fired only because no run had yet failed terminally.
 
-A failure now stops holding in exactly two cases: the stage's `input_hash`
-changed, or it was `BUDGET_EXHAUSTED` on an earlier **IST** day (the cap day).
-Anything else is a person's decision — `castrol run <ref> --retry`.
+A failure now stops holding in exactly three cases: the stage's `input_hash`
+changed, it was `BUDGET_EXHAUSTED` on an earlier **IST** day (the cap day), or
+it was `VENDOR_UNAVAILABLE` and has cooled off. Anything else is a person's
+decision — `castrol run <ref> --retry`.
 `advance_job` judges by the LATEST run per stage for the same reason, so a job
 being retried reads `running`, not `failed`.
+
+**The third case RELAXES this invariant, deliberately (2026-11-20).** A
+provider-side 500 is the provider failing on its own side, not a verdict on our
+inputs, and every job Batches 1 and 2 lost to one rendered in the end — after
+four rounds of `retry-failed` by hand. So once its own 12 attempts are spent,
+the failure holds for `UNAVAILABLE_RELEASE_AFTER_S` (30 min) and then releases
+with a fresh run, until the attempts summed over EVERY run of that stage at
+those inputs reach `UNAVAILABLE_LIFETIME_ATTEMPTS` (24). Past the cap it holds
+for a person, exactly as before. It stays bounded because every attempt is a
+`vendor_usage` reservation even though a failed render refunds (invariant 24).
+`orchestrator.failure_decision` is the one place this is decided; the cycle
+sweeps for due releases every 5 minutes and counts them as outstanding work,
+so it waits for them instead of leaving them to the next timer. Pinned by
+[`tests/test_self_retry.py`](tests/test_self_retry.py).
 
 **35. An unapproved language never renders, and clears itself on approval —
 and language enters a hash only outside Hindi.**
@@ -1582,6 +1607,31 @@ for 15s. It used to read as `code != 200` → `VendorRejected` → terminal. A
 sliding window and not a token bucket, on purpose: a bucket lets 2N through
 across a window edge. Per process, so a hand-run `castrol run` beside the cycle
 has its own — which is why the default sits under the provider's figure.
+
+**What this means for the hand-run commands.** `castrol run`, `work`, `drain`
+and `poll` go through the same gates as the cycle. A blocked stage (credits,
+outage pause, the in-flight cap, no request slot) reads as "nothing to do right
+now", so `drain` / `work --stage video` report 0 and stop rather than wait, and
+`castrol run <job>` waits while the cycle holds all 60 render slots. A provider
+500 under `castrol run` gets the long 12-attempt budget too. And a 429 or 402
+on submit still spends its `vendor_usage` reservation — `budget.vendor_call`
+reserves before the request — which is bounded by the limiter and deliberate,
+like every other reservation.
+
+**A provider outage pauses submits, and so does an empty balance**
+(2026-11-20, [`common/health.py`](src/castrol_pipeline/common/health.py)).
+When at least 90% of the last 20–30 renders (no older than 20 min) came back as
+provider 500s, new video submits stop for 5 minutes, then two probes go out; a
+probe that renders ends the outage, one that 500s pauses again for twice as
+long, up to 30 minutes. The ordinary 30–60% failure rate under load never
+trips it — that is the retry budget's job. A 402 / "Credits insufficient" is
+`VENDOR_OUT_OF_CREDITS`: the run goes back with its attempt returned, every
+submit to that provider stops, and the balance endpoint is asked every 5
+minutes until it covers the renders owed (capped at one full set of render
+slots, so a partial top-up resumes a 500-video batch). It used to be a terminal
+`VendorRejected` on every job it touched. Both pauses are on SUBMITS only:
+renders already accepted are still collected. At cycle start the balance is
+compared with the renders queued, and a shortfall is `cycle.credits_short`.
 
 **The run is automated, twice a day.** `castrol cycle` is the whole flow —
 pull, schedule, work, wait, stop — driven by a systemd timer at 00:00 and 12:00
