@@ -63,7 +63,7 @@ from .common import db
 from .common.events import record_event
 from .common.logging import get_logger
 from .config import get_settings
-from .stages.base import DEFAULT_PLAN
+from .stages.base import PipelineStage
 
 log = get_logger(__name__)
 
@@ -76,6 +76,46 @@ CYCLE_LOCK_KEY = 1
 #: run has a known due time and could be slept to exactly, but waking up
 #: periodically keeps the log showing a live process.
 MAX_SLEEP_S = 300
+
+#: The three lanes of a tick, plus the card burn on its own thread. Together
+#: they are exactly `DEFAULT_PLAN`, which `tests/test_cycle_flow.py` pins, so a
+#: stage added to the plan cannot silently be left out of the loop.
+#:
+#: DOWNSTREAM is drained to empty on every tick. It is bounded by the card
+#: burn's own throughput (one video every ~35s on the worker), each run takes
+#: about a second, and these are the stages that put a finished video in front
+#: of the mechanic.
+DOWNSTREAM_STAGES: tuple[PipelineStage, ...] = (
+    PipelineStage.CHECKS,
+    PipelineStage.PUBLISH,
+    PipelineStage.DELIVER,
+)
+#: The paid render. Submit and release, so a drain is a few HTTP calls.
+RENDER_STAGES: tuple[PipelineStage, ...] = (PipelineStage.VIDEO,)
+#: Upstream gets a time slice per tick, round-robin, most-downstream first, so
+#: a fresh 500-job intake feeds renders as it goes instead of prepping all 500
+#: before the first voiceover is made.
+UPSTREAM_STAGES: tuple[PipelineStage, ...] = (
+    PipelineStage.IMAGE,
+    PipelineStage.AUDIO,
+    PipelineStage.PREP,
+)
+#: Run by `CompositeWorker`, never by the tick.
+WORKER_STAGES: tuple[PipelineStage, ...] = (PipelineStage.COMPOSITE,)
+
+#: Seconds of upstream work per tick before the loop goes back to polling.
+UPSTREAM_SLICE_S = 15.0
+
+#: How long the composite worker waits before looking again when its queue is
+#: empty. Short, because a render that just came back is waiting on it.
+COMPOSITE_IDLE_S = 2.0
+
+#: How long `halt()` waits for an in-progress card burn to finish. A burn that
+#: is cut off leaves its run `claimed`, and the reaper returns it to the queue,
+#: so nothing is lost past this - the stage is local ffmpeg and free.
+COMPOSITE_JOIN_S = 120.0
+#: The same, after a SIGTERM, which leaves ten seconds before the SIGKILL.
+COMPOSITE_STOP_JOIN_S = 3.0
 
 #: What "the database went away" looks like from here. `PoolTimeout`, raised
 #: when the pool cannot hand out a connection, subclasses `OperationalError`,
@@ -117,6 +157,125 @@ def _stop_on_sigterm() -> Iterator[threading.Event]:
         yield stop
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+class CompositeWorker(threading.Thread):
+    """Burns cards one after another, off the tick loop's thread.
+
+    The card burn is the only slow thing the cycle does itself: ~35s per video
+    on the worker at `-preset medium` (PR #11), against about a second for
+    every other stage. In the main loop it blocked polling and delivery for as
+    long as its queue lasted. On a thread it runs back to back while the tick
+    keeps polling and delivering.
+
+    One thread, not a pool. The t3.medium has two vCPUs and ffmpeg already uses
+    both (`-threads 2`), so a second burn would halve the speed of each and
+    deliver nothing sooner.
+
+    It never decides anything. `execute_one` claims, runs, records and
+    reschedules exactly as it does in the main thread. The pool is thread-safe
+    and claiming is `SKIP LOCKED`.
+
+    An exception that escapes `execute_one` is a database or code failure, not
+    a stage failure (those are caught and recorded inside it). It stops the
+    worker and is re-raised on the main thread by `raise_if_failed`, so a lost
+    database still ends the cycle as `cycle.db_lost` and a bug still crashes.
+    """
+
+    def __init__(self, stop: threading.Event) -> None:
+        super().__init__(name="composite-worker", daemon=True)
+        self._stop_signal = stop
+        self._halt = threading.Event()
+        self.error: BaseException | None = None
+        #: True from before a claim until after the reschedule that follows.
+        self.busy = False
+        #: Calls to `execute_one` that returned, found work or not.
+        self.calls = 0
+        #: Runs actually executed.
+        self.done = 0
+
+    def _should_stop(self) -> bool:
+        return self._halt.is_set() or self._stop_signal.is_set()
+
+    def run(self) -> None:
+        from .orchestrator import execute_one
+
+        while not self._should_stop():
+            self.busy = True
+            try:
+                did = execute_one(PipelineStage.COMPOSITE)
+            except BaseException as exc:  # noqa: BLE001 - handed to the main thread
+                self.error = exc
+                log.error("cycle.composite_worker_failed", error=str(exc)[:400])
+                return
+            finally:
+                self.calls += 1
+                self.busy = False
+            if did:
+                self.done += 1
+            else:
+                self._halt.wait(COMPOSITE_IDLE_S)
+
+    def halt(self) -> None:
+        """Stop claiming, and give a burn in progress a chance to finish.
+
+        After a SIGTERM the wait is short: `docker stop` sends SIGKILL ten
+        seconds later, and the cycle still has to write `cycle.interrupted`
+        before then. The thread is a daemon, so an unfinished burn dies with
+        the process and its `claimed` run is reaped back to the queue.
+        """
+        self._halt.set()
+        if self.is_alive():
+            self.join(COMPOSITE_STOP_JOIN_S if self._stop_signal.is_set() else COMPOSITE_JOIN_S)
+
+    def raise_if_failed(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+
+def _drain_all(
+    stages: tuple[PipelineStage, ...], totals: dict[str, int], stop: threading.Event
+) -> int:
+    """Drain each stage to empty, in order. Returns runs executed."""
+    from .orchestrator import drain_stage
+
+    ran = 0
+    for stage in stages:
+        if stop.is_set():
+            break
+        n = drain_stage(stage)
+        if n:
+            totals[str(stage)] = totals.get(str(stage), 0) + n
+            ran += n
+    return ran
+
+
+def _drain_for(
+    stages: tuple[PipelineStage, ...],
+    seconds: float,
+    totals: dict[str, int],
+    stop: threading.Event,
+) -> bool:
+    """Round-robin one run per stage until the slice is spent or all are empty.
+
+    Returns True if it stopped on time with work still queued, which tells the
+    loop to come straight back rather than wait out a tick.
+    """
+    from .orchestrator import execute_one
+
+    end = time.monotonic() + seconds
+    active = list(stages)
+    while active and not stop.is_set():
+        for stage in list(active):
+            if stop.is_set():
+                return False
+            if execute_one(stage):
+                totals[str(stage)] = totals.get(str(stage), 0) + 1
+            else:
+                active.remove(stage)
+            if time.monotonic() >= end:
+                return bool(active)
+    return False
 
 
 def intake_window(lookback_days: int, *, today: date | None = None) -> tuple[date, date]:
@@ -377,7 +536,7 @@ def run_cycle(
     *,
     lookback_days: int = 1,
     deadline_minutes: int = 480,
-    interval_s: int = 60,
+    interval_s: int = 20,
     fetch: bool = True,
 ) -> dict[str, Any]:
     """Pull, then work until everything is terminal or the deadline is reached.
@@ -444,9 +603,22 @@ def _work(
     fetch: bool,
     clock_start: float,
 ) -> None:
-    """Everything the cycle does while it holds the lock. Fills in `summary`."""
+    """Everything the cycle does while it holds the lock. Fills in `summary`.
+
+    A tick loop, not a sequence of drain-everything passes. Each tick: reap,
+    poll what is in flight, then advance every quick stage, downstream first.
+    The card burn runs on its own thread (`CompositeWorker`), so a 35-second
+    ffmpeg never holds up a poll or a delivery, and upstream work gets a
+    bounded slice of each tick so a 500-job intake cannot either.
+
+    It replaced passes that drained each stage of `DEFAULT_PLAN` to empty in
+    turn and polled once at the end. On Batch 2 that meant a render finishing
+    a minute into a pass waited behind the whole card-burn backlog before
+    anything looked at it again, and a finished video waited up to an hour
+    for its delivery.
+    """
     from .intake.runner import run_intake
-    from .orchestrator import _checked_mode, drain_stage, poll_once, reap
+    from .orchestrator import _checked_mode, poll_once, reap
 
     deadline = clock_start + deadline_minutes * 60
 
@@ -479,44 +651,75 @@ def _work(
     summary["scheduled"] = _schedule_all()
 
     totals: dict[str, int] = summary["stage_runs"]
-    while not stop.is_set():
-        summary["passes"] += 1
-        reap()
+    worker = CompositeWorker(stop)
+    worker.start()
+    try:
+        while not stop.is_set():
+            summary["passes"] += 1
+            worker.raise_if_failed()
+            reap()
 
-        for stage in DEFAULT_PLAN:
+            completed = poll_once()
+            if completed:
+                totals["poll"] = totals.get("poll", 0) + completed
             if stop.is_set():
                 break
-            n = drain_stage(stage)
-            if n:
-                totals[str(stage)] = totals.get(str(stage), 0) + n
-        if stop.is_set():
-            break
 
-        completed = poll_once()
-        if completed:
-            totals["poll"] = totals.get("poll", 0) + completed
+            # Finished renders first: a video that came back this tick is
+            # carded by the worker and then checked, published and delivered
+            # here, without waiting behind anybody else's upstream work.
+            _drain_all(DOWNSTREAM_STAGES, totals, stop)
+            _drain_all(RENDER_STAGES, totals, stop)
+            more_upstream = _drain_for(UPSTREAM_STAGES, UPSTREAM_SLICE_S, totals, stop)
+            if stop.is_set():
+                break
 
-        left = outstanding_work()
-        log.info("cycle.pass", pass_no=summary["passes"], **{
-            k: v for k, v in left.items() if k != "next_due"
-        })
-        if left["total"] == 0:
-            break
+            # Read the worker's state BEFORE the queue and again after. The
+            # composite stage enqueues `checks` in its own `finally`, so a
+            # queue that reads empty while the worker is mid-run is not empty.
+            calls_before, busy_before = worker.calls, worker.busy
+            left = outstanding_work()
+            log.info("cycle.pass", pass_no=summary["passes"],
+                     composites=worker.done, **{
+                         k: v for k, v in left.items() if k != "next_due"
+                     })
+            if (
+                left["total"] == 0
+                and not busy_before
+                and not worker.busy
+                and worker.calls == calls_before
+            ):
+                break
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            # Not a failure of any job — everything is still queued and the
-            # next cycle resumes it. It IS a signal that a batch is taking
-            # longer than the gap between runs, which is worth waking up for.
-            summary["deadline_hit"] = True
-            summary["outstanding"] = {k: left[k] for k in ("queued", "in_flight")}
-            log.warning("cycle.deadline", **summary["outstanding"])
-            record_event("cycle.deadline", level="warning", **summary["outstanding"])
-            break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Not a failure of any job — everything is still queued and the
+                # next cycle resumes it. It IS a signal that a batch is taking
+                # longer than the gap between runs, which is worth waking up for.
+                summary["deadline_hit"] = True
+                summary["outstanding"] = {k: left[k] for k in ("queued", "in_flight")}
+                log.warning("cycle.deadline", **summary["outstanding"])
+                record_event("cycle.deadline", level="warning", **summary["outstanding"])
+                break
 
-        # An Event wait and not time.sleep, so that a SIGTERM ends the wait
-        # at once and not up to MAX_SLEEP_S later.
-        stop.wait(next_sleep(left, interval_s, remaining))
+            if more_upstream:
+                # The upstream slice ran out of time, not out of work. Go round
+                # again at once: the poll and the downstream drain come first
+                # on every tick, so nothing finished waits behind this.
+                continue
+
+            wait = next_sleep(left, interval_s, remaining)
+            if worker.busy or left["queued"]:
+                # A composite finishing enqueues `checks`; do not sit out a
+                # long retry backoff while a finished video waits for it.
+                wait = min(wait, float(interval_s))
+            # An Event wait and not time.sleep, so that a SIGTERM ends the wait
+            # at once and not up to MAX_SLEEP_S later.
+            stop.wait(wait)
+    finally:
+        worker.halt()
+    worker.raise_if_failed()
+    summary["composites"] = worker.done
 
     summary["elapsed_s"] = round(time.monotonic() - clock_start, 1)
     if stop.is_set():
