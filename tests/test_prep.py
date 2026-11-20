@@ -351,7 +351,7 @@ class TestVernaculars:
 
     def test_unknown_language_is_an_error_not_hindi(self):
         with pytest.raises(ScriptError):
-            fill_script(version="v1", language="or", name="A", workshop="B", locality="C")
+            fill_script(version="v1", language="mr", name="A", workshop="B", locality="C")
 
     @pytest.mark.parametrize("lang", LANGS)
     def test_long_digit_runs_never_get_hindi_words(self, lang):

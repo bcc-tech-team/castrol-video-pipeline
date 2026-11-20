@@ -295,6 +295,36 @@ LANGUAGES: tuple[Language, ...] = (
             ),
         },
     ),
+    # Odia, added 2026-11-16 from the client's copy. There is no draft of
+    # ours, so the client's copy is v1. The copy arrived with its slot
+    # markers in TELUGU script ([మెకానిక్ పేరు], [వర్క్షాప్ ], [స్థానం]),
+    # mapped here by meaning to name / workshop / locality; the Odia text
+    # around them is verbatim, including the space before the case endings
+    # ("{workshop} ରୁ", "{locality} ରେ") and the Odia digit ୮.
+    #
+    # APPROVED 2026-11-16 after one audio take (Raju Shetty / Shetty Motors /
+    # Andheri, Mumbai; 25.5s) was heard and accepted, as the other five were.
+    # That makes it live: the first export row in Odia renders for a real
+    # mechanic. The voice provider lists `or` from sonic-3.6 onward.
+    Language(
+        code="or", name="Odia",
+        # Two spellings of ଓଡ଼ିଆ: the nukta decomposed (what NFC yields) and
+        # precomposed U+0B5C, since the match is casefold and not normalised.
+        aliases=("odia", "oriya", "ଓଡ଼ିଆ", "ଓଡ଼ିଆ"),
+        current="v1", approved=True, tts_language="or",
+        templates={
+            "v1": (
+                "ମୁଁ ହେଉଛି {name}, {workshop} ରୁ। ସର୍ଭିସ୍ ହେଉ କି ରିପେୟାର୍, "
+                "ପ୍ରତ୍ୟେକ ଗାଡ଼ିର ଭଲଭାବେ ଯତ୍ନ ନେବା ମୋର ଦାୟିତ୍ୱ।\n"
+                "ଗାଡ଼ି ଷ୍ଟାର୍ଟ ହେବାର ପ୍ରଥମ ୮ ସେକେଣ୍ଡରେ ଇଞ୍ଜିନ୍‌ରେ ସବୁଠାରୁ ଅଧିକ "
+                "ୱେୟାର୍ ହୁଏ। ଏଥିରୁ ବଞ୍ଚିବା ପାଇଁ ମୁଁ Castrol MAGNATEC Full "
+                "Synthetic Premium Oil ବ୍ୟବହାର କରିବାକୁ ସୁପାରିଶ କରେ, ଯାହା "
+                "ଆରମ୍ଭରୁ ହିଁ ପ୍ରୋଟେକ୍ସନ୍ ଦେବା ଆରମ୍ଭ କରେ।\n"
+                "ଆସନ୍ତୁ, {locality} ରେ ଆମ ସହ ଯୋଗାଯୋଗ କରନ୍ତୁ କିମ୍ବା ସ୍କ୍ରିନ୍‌ରେ "
+                "ଦିଆଯାଇଥିବା ନମ୍ବରରେ କଲ୍ କରନ୍ତୁ।"
+            ),
+        },
+    ),
 )
 
 _BY_CODE: dict[str, Language] = {lang.code: lang for lang in LANGUAGES}
