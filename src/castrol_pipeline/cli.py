@@ -704,6 +704,7 @@ def report(batch_id: Annotated[str | None, typer.Option(help="Defaults to latest
     """The morning number: pulled / new / rejected / created / completed / failed."""
     _boot()
     from .common import db
+    from .common.alerts import recent as recent_alerts
 
     batch = db.fetch_one(
         "SELECT * FROM batches WHERE id = %(id)s;" if batch_id
@@ -742,6 +743,8 @@ def report(batch_id: Annotated[str | None, typer.Option(help="Defaults to latest
                 "jobs_created": batch["jobs_created"],
                 "reject_codes": batch["stage_failure_counts"],
                 "jobs_by_status": {r["status"]: r["n"] for r in jobs},
+                # The line a person reads first: is there anything to do?
+                "alerts_24h": [f"{a['event']}: {a['summary']}" for a in recent_alerts(24)],
                 "stage_runs": [
                     {"stage": r["stage"], "status": r["status"], "n": r["n"]} for r in stages
                 ],
@@ -750,6 +753,24 @@ def report(batch_id: Annotated[str | None, typer.Option(help="Defaults to latest
             default=str,
         )
     )
+
+
+@app.command("alerts")
+def alerts_cmd(
+    hours: Annotated[float, typer.Option(help="How far back to look")] = 24,
+) -> None:
+    """What needs a person: credits too low, a long provider outage, a job
+    past its retry cap. Newest first. Exit 1 if there are any, so a cron or a
+    shell `&&` can act on it."""
+    _boot()
+    from .common.alerts import recent
+
+    rows = recent(hours)
+    for r in rows:
+        typer.echo(f"{r['created_at']:%Y-%m-%d %H:%M} {r['event']:<24} {r['summary']}")
+    if not rows:
+        typer.echo(f"No alerts in the last {hours:g}h.")
+    raise typer.Exit(1 if rows else 0)
 
 
 @app.command("seed-panel-data")

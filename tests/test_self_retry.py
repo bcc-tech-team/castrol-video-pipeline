@@ -39,6 +39,12 @@ def events(monkeypatch) -> list[tuple[str, dict]]:
     rec = lambda name, **kw: got.append((name, kw))  # noqa: E731
     monkeypatch.setattr(health, "record_event", rec)
     monkeypatch.setattr(orchestrator, "record_event", rec)
+    # Alerts are PR 4's business and have their own tests; here they are
+    # recorded like any event, and never deduped against a database.
+    from castrol_pipeline.common import alerts
+
+    monkeypatch.setattr(alerts, "record_event", rec)
+    monkeypatch.setattr(alerts, "_recently_raised", lambda alert: False)
     return got
 
 
@@ -223,7 +229,7 @@ class TestOutOfCredits:
                             lambda: {"renders": 500, "usd": 540.0, "per_render_usd": 1.08})
         out = orchestrator.credits_preflight()
         assert out is not None and out["short"] is True
-        assert [n for n, _ in events] == ["cycle.credits_short"]
+        assert [n for n, _ in events] == ["cycle.credits_short", "alert.credits_low"]
 
     def test_no_balance_endpoint_means_no_preflight(self, monkeypatch):
         monkeypatch.setattr(orchestrator, "get_stage_registry", lambda: {S.VIDEO: object()})
@@ -295,6 +301,7 @@ class TestSelfReleasingHold:
         assert orchestrator.release_due_failures() == {"released": 1, "capped": 0}
         assert released == ["job-2", "job-2"]
         assert [n for n, _ in events].count("job.attempt_cap_reached") == 1
+        assert [n for n, _ in events].count("alert.job_attempt_cap") == 1
 
     def test_pending_releases_count_toward_the_cycle(self):
         now = datetime.now(UTC)
