@@ -100,7 +100,7 @@ class TestWhatRaisesThem:
         h = health.ProviderHealth("video", health.OutagePolicy(pause_s=300), clock=lambda: t[0])
         monkeypatch.setattr(health, "all_health", lambda: {"video": h})
         for _ in range(20):
-            h.record_render(failed=True)
+            h.record_verdict(failed=True)
         t[0] = 59 * 60
         assert orchestrator.check_alerts() == []
         t[0] = 61 * 60
