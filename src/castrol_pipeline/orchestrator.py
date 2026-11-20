@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any
@@ -22,8 +24,13 @@ from zoneinfo import ZoneInfo
 import httpx
 from psycopg.types.json import Jsonb
 
-from .common import db
-from .common.errors import TERMINAL_STAGE_ERRORS, PipelineError, StageErrorCode
+from .common import db, pacing
+from .common.errors import (
+    TERMINAL_STAGE_ERRORS,
+    PipelineError,
+    StageErrorCode,
+    VendorThrottled,
+)
 from .common.events import record_event
 from .common.logging import get_logger, job_context
 from .config import get_settings
@@ -564,6 +571,42 @@ def redo_stage(job_id: str, stage: PipelineStage) -> dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------ pacing --
+
+
+def submit_blocked(stage: PipelineStage) -> str | None:
+    """Why no new run of `stage` may be sent right now, or None if one may.
+
+    Asked BEFORE claiming, so a blocked stage spends no attempt and reserves
+    no budget. Today that is the in-flight cap (`pacing.in_flight_cap`).
+    """
+    cap = pacing.in_flight_cap(stage)
+    if cap is not None and db.count_in_flight(str(stage)) >= cap:
+        return f"{cap} {stage} runs already in flight"
+    return None
+
+
+def _throttled(
+    stage: PipelineStage, exc: BaseException, *, job_id: str, run_id: str, on: str
+) -> None:
+    """A provider said 429. Close its limiter and say so, once per refusal."""
+    backoff = get_settings().throttle_backoff_s
+    gate = pacing.limiter_for(stage)
+    if gate is not None:
+        gate.back_off(backoff)
+    log.warning("vendor.throttled", stage=str(stage), on=on, backoff_s=backoff)
+    record_event(
+        "vendor.throttled",
+        job_id=job_id,
+        stage=str(stage),
+        stage_run_id=run_id,
+        level="warning",
+        on=on,
+        backoff_s=backoff,
+        error=str(exc)[:300],
+    )
+
+
 # ------------------------------------------------------------- worker loop --
 
 
@@ -575,6 +618,11 @@ def execute_one(
     `job_id` restricts the claim to one job; see `jobrun.run_job`.
     """
     worker = worker or worker_identity()
+    if submit_blocked(stage):
+        # Not "empty", but nothing to do for now: the caller moves on and the
+        # next tick looks again. Checked BEFORE the claim, so no attempt is
+        # spent on a run that was never going to be sent.
+        return False
     run = db.claim_stage_run(str(stage), worker, job_id)
     if run is None:
         return False
@@ -582,10 +630,15 @@ def execute_one(
     job_id = str(run["job_id"])
     run_id = str(run["id"])
     impl = get_stage_registry()[stage]
+    gate = pacing.limiter_for(stage)
 
     with job_context(job_id, stage=str(stage), run_id=run_id):
         log.info("stage.claimed", attempts=run["attempts"])
         try:
+            if gate is not None and not gate.acquire(get_settings().provider_slot_wait_s):
+                db.release_claim(run_id, delay_seconds=0,
+                                 reason=f"{stage}: no request slot this tick")
+                return False
             ctx = load_context(job_id)
             outcome = impl.run(ctx)
 
@@ -608,6 +661,15 @@ def execute_one(
             if stage == PipelineStage.DELIVER:
                 _record_delivery(ctx, outcome)
             log.info("stage.succeeded", output_key=outcome.output_key)
+
+        except VendorThrottled as exc:
+            # The provider refused the request before looking at it. Nothing
+            # landed and nothing was billed, so the run goes straight back with
+            # its attempt returned, and the provider gets a breather.
+            _throttled(stage, exc, job_id=job_id, run_id=run_id, on="submit")
+            db.release_claim(run_id, delay_seconds=get_settings().throttle_backoff_s,
+                             reason=str(exc)[:500])
+            return False
 
         except Exception as exc:  # noqa: BLE001 - the orchestrator is the boundary
             code = exc.code if isinstance(exc, PipelineError) else StageErrorCode.INTERNAL
@@ -694,26 +756,87 @@ _TRANSIENT_POLL_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+#: When each in-flight run was last polled, by run id, in this process.
+#: In memory on purpose: it only spaces out polls, and a restart that forgets
+#: it costs one extra poll per task.
+_LAST_POLLED: dict[str, float] = {}
+_LAST_POLLED_LOCK = threading.Lock()
+
+
+def _poll_interval(stage: PipelineStage) -> float:
+    s = get_settings()
+    return {
+        PipelineStage.VIDEO: s.video_poll_interval_s,
+        PipelineStage.IMAGE: s.image_poll_interval_s,
+    }.get(stage, 0.0)
+
+
+def poll_order(
+    rows: list[dict[str, Any]],
+    last_polled: dict[str, float],
+    now: float,
+    interval_for: Any = _poll_interval,
+) -> list[dict[str, Any]]:
+    """Which in-flight runs to poll this pass, least recently polled first. Pure.
+
+    A run polled within its stage's interval is left out. Never-polled runs
+    come first, oldest submit first. The old order was `started_at` with a
+    LIMIT, which at more than `limit` in flight never polled the newest ones.
+    """
+    due = []
+    for run in rows:
+        rid = str(run["id"])
+        seen = last_polled.get(rid)
+        stage = PipelineStage(str(run["stage"]))
+        if seen is not None and now - seen < interval_for(stage):
+            continue
+        due.append((seen if seen is not None else float("-inf"), run))
+    never = datetime.min.replace(tzinfo=UTC)
+    due.sort(key=lambda pair: (pair[0], pair[1].get("started_at") or never))
+    return [run for _, run in due]
+
+
 def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
-    """Reconcile in-flight async vendor tasks. Returns how many completed."""
+    """Reconcile in-flight async vendor tasks. Returns how many completed.
+
+    Paced: each poll takes a request slot from its provider's limiter, and a
+    provider whose slots run out, or that answers 429, is left alone for the
+    rest of the pass. `limit` bounds the polls made, not the rows read.
+    """
     registry = get_stage_registry()
     rows = db.fetch_all(
         """
         SELECT * FROM stage_runs
          WHERE status = 'running' AND vendor_task_id IS NOT NULL
            AND (%(job_id)s::uuid IS NULL OR job_id = %(job_id)s::uuid)
-         ORDER BY started_at
-         LIMIT %(limit)s;
+         ORDER BY started_at;
         """,
-        {"limit": limit, "job_id": job_id},
+        {"job_id": job_id},
     )
+    with _LAST_POLLED_LOCK:
+        live = {str(r["id"]) for r in rows}
+        for rid in [k for k in _LAST_POLLED if k not in live]:
+            del _LAST_POLLED[rid]
+        ordered = poll_order(rows, dict(_LAST_POLLED), time.monotonic())
 
     completed = 0
-    for run in rows:
+    polled = 0
+    exhausted: set[PipelineStage] = set()
+    slot_wait = get_settings().provider_slot_wait_s
+    for run in ordered:
+        if polled >= limit:
+            break
         stage = PipelineStage(str(run["stage"]))
         impl = registry.get(stage)
-        if impl is None or not getattr(impl, "is_async", False):
+        if impl is None or not getattr(impl, "is_async", False) or stage in exhausted:
             continue
+        gate = pacing.limiter_for(stage)
+        if gate is not None and not gate.acquire(slot_wait):
+            exhausted.add(stage)
+            continue
+        polled += 1
+        with _LAST_POLLED_LOCK:
+            _LAST_POLLED[str(run["id"])] = time.monotonic()
 
         job_id = str(run["job_id"])
         with job_context(job_id, stage=str(stage), run_id=str(run["id"])):
@@ -730,6 +853,14 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                 _persist_result(ctx, run, result)
                 completed += 1
                 log.info("stage.polled_complete", output_key=result.output_key)
+            except VendorThrottled as exc:
+                # Not an answer about the task, which is untouched. Leave it
+                # `running` and stop asking this provider for the rest of the
+                # pass; the overdue check still bounds a task that never
+                # comes back.
+                exhausted.add(stage)
+                _throttled(stage, exc, job_id=job_id, run_id=str(run["id"]), on="poll")
+                _fail_if_overdue(run, stage)
             except _TRANSIENT_POLL_ERRORS as exc:
                 # The vendor task is untouched by OUR connection dropping, so
                 # the run stays `running` and the next pass polls the same

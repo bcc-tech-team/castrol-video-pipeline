@@ -768,6 +768,7 @@ rules, not application code.
 | The eight real stages | [`stages/real.py`](src/castrol_pipeline/stages/real.py) |
 | Stage protocol + the DAG | [`stages/base.py`](src/castrol_pipeline/stages/base.py) |
 | Anything that talks to a provider | [`stages/vendors.py`](src/castrol_pipeline/stages/vendors.py) |
+| Request limiter per provider, in-flight caps | [`common/pacing.py`](src/castrol_pipeline/common/pacing.py) |
 | Anything local and free — **the card**, ffmpeg, ffprobe | [`stages/media.py`](src/castrol_pipeline/stages/media.py) |
 | No-spend doubles (`USE_STUB_STAGES=true`) | [`stages/stubs.py`](src/castrol_pipeline/stages/stubs.py) |
 | **The only path to a paid vendor** | [`common/budget.py`](src/castrol_pipeline/common/budget.py) |
@@ -1012,6 +1013,9 @@ missed probe bills 5s for a 35s video and no cap notices.
 Neither gateway has one — the field does not exist. A network-level retry of a
 submit creates a second provider job and a second charge. Dedupe *before* the
 HTTP call; never blind-retry a submit that may have landed. Reconcile instead.
+A 429 is not one that may have landed — it is refused before it is looked at —
+so `VENDOR_THROTTLED` puts the run back for another try (see the pacing note
+under Current phase).
 
 **14. Check the body, not the HTTP status.**
 *`stages/vendors.py`, `stages/real.py:webhook_accepted`, pinned by [`tests/test_deliver_webhook.py`](tests/test_deliver_webhook.py)*
@@ -1565,6 +1569,19 @@ uses both vCPUs. The loop must not end while that thread is mid-burn — the
 burn enqueues `checks` in its own `finally`, so the queue reads empty until it
 has — and an error on the thread is re-raised on the main one, so a lost
 database is still `cycle.db_lost`. See `docs/TECH_DESIGN.md` §2.
+
+**Every provider request is paced, and a 429 never fails a run**
+(2026-11-20, [`common/pacing.py`](src/castrol_pipeline/common/pacing.py)). One
+sliding-window limiter per provider covers submit AND poll — 15 per 10s on
+video against the provider's 20 — plus an in-flight cap checked before the
+claim (`MAX_CONCURRENCY_VIDEO=60`, `MAX_CONCURRENCY_IMAGE=40`; both settings
+existed before and nothing read them). A 429, as HTTP status or body code, is
+`VENDOR_THROTTLED`: on submit the run is put back with its attempt returned
+(`db.release_claim`), on poll the task stays `running`, and the limiter closes
+for 15s. It used to read as `code != 200` → `VendorRejected` → terminal. A
+sliding window and not a token bucket, on purpose: a bucket lets 2N through
+across a window edge. Per process, so a hand-run `castrol run` beside the cycle
+has its own — which is why the default sits under the provider's figure.
 
 **The run is automated, twice a day.** `castrol cycle` is the whole flow —
 pull, schedule, work, wait, stop — driven by a systemd timer at 00:00 and 12:00

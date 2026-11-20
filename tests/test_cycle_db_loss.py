@@ -175,7 +175,7 @@ def quiet_cycle(monkeypatch: pytest.MonkeyPatch):
     # The upstream slice and the composite worker thread both claim through
     # execute_one. False is an empty queue.
     monkeypatch.setattr(orchestrator, "execute_one", lambda stage: False)
-    monkeypatch.setattr(orchestrator, "poll_once", lambda: 0)
+    monkeypatch.setattr(orchestrator, "poll_once", lambda **k: 0)
     return events
 
 

@@ -369,6 +369,47 @@ def mark_failed(
         )
 
 
+def release_claim(run_id: str, *, delay_seconds: float, reason: str) -> None:
+    """Put a claimed run back in the queue as if it had never been claimed.
+
+    For a request the provider refused before looking at it (a 429), or one
+    we chose not to send (a paused provider). `attempts` is handed back,
+    because claiming took it and nothing was attempted: without that, a busy
+    afternoon of 429s would spend a run's whole retry budget on requests that
+    never reached a render. The cost columns are untouched - nothing reached
+    `mark_running`, so there is nothing on the row to undo.
+
+    `error_code` is left as it was. The reason goes in `error_message`, where
+    `castrol show` prints it, rather than overwriting the code of a real
+    failure on an earlier attempt.
+    """
+    execute(
+        """
+        UPDATE stage_runs
+           SET status = 'pending',
+               claimed_by = NULL,
+               claimed_at = NULL,
+               attempts = greatest(attempts - 1, 0),
+               error_message = %(reason)s,
+               next_attempt_at = now() + make_interval(secs => %(delay)s)
+         WHERE id = %(id)s AND status = 'claimed';
+        """,
+        {"id": run_id, "delay": float(delay_seconds), "reason": reason[:2000]},
+    )
+
+
+def count_in_flight(stage: str) -> int:
+    """Runs of `stage` claimed or running right now: the in-flight cap's count."""
+    row = fetch_one(
+        """
+        SELECT count(*) AS n FROM stage_runs
+         WHERE stage = %(stage)s AND status IN ('claimed', 'running');
+        """,
+        {"stage": stage},
+    )
+    return int(row["n"]) if row else 0
+
+
 def reap_stuck_claims(timeout_seconds: int) -> int:
     """Return rows stuck in `claimed` to `pending`.
 

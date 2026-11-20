@@ -24,7 +24,9 @@ import hashlib
 import math
 import subprocess
 import tempfile
+import threading
 import time
+from bisect import bisect_right
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -36,6 +38,7 @@ from ..common.errors import (
     StageErrorCode,
     StageFailure,
     VendorRejected,
+    VendorThrottled,
     VendorTimeout,
 )
 from ..common.events import record_event
@@ -147,6 +150,95 @@ def _fail_at_submit(ctx: JobContext, stage: PipelineStage) -> None:
             f"[mock] {stage}: transient provider error, first attempt only",
             code=StageErrorCode.VENDOR_TIMEOUT,
         )
+
+
+# ------------------------------------------------- the mock video provider --
+
+
+def parse_windows(spec: str) -> list[tuple[float, float]]:
+    """"300-420,900-960" -> [(300, 420), (900, 960)], seconds. Pure.
+
+    Raises on anything it cannot read, for the same reason `parse_failures`
+    does: a typo that meant "no 429s" would make a rehearsal look cleaner than
+    production.
+    """
+    out: list[tuple[float, float]] = []
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        try:
+            a, b = (float(x) for x in part.split("-"))
+        except ValueError:
+            raise ValueError(f"cannot read window {part!r}; expected start-end") from None
+        if not 0 <= a < b:
+            raise ValueError(f"window {part!r} must run forwards from 0 or later")
+        out.append((a, b))
+    return out
+
+
+def max_in_any_window(times: list[float], window_s: float) -> int:
+    """The most timestamps inside any half-open window of `window_s`. Pure."""
+    ts = sorted(times)
+    best = 0
+    for i, t in enumerate(ts):
+        # Everything in [t, t + window_s).
+        j = bisect_right(ts, t + window_s - 1e-9)
+        best = max(best, j - i)
+    return best
+
+
+class MockVideoProvider:
+    """The video provider's request limit, enforced the way the real one does.
+
+    Every request the mock video stage makes - submit and poll - is logged here
+    first, and refused with a 429 when it is the 21st in 10 seconds or falls in
+    a `MOCK_THROTTLE_WINDOWS` stretch. The log is what lets a rehearsal PROVE
+    the pipeline stayed under the limit rather than assume it.
+
+    In memory, per process: the rehearsal runs the cycle in-process and reads
+    it back afterwards. The epoch is when this process first used it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.epoch = time.time()
+            self.requests: list[tuple[float, str, bool]] = []  # (time, kind, refused)
+
+    def elapsed(self, now: float | None = None) -> float:
+        return (now or time.time()) - self.epoch
+
+    def request(self, kind: str) -> None:
+        """Log one request; raise VendorThrottled if the provider refuses it."""
+        s = get_settings()
+        now = time.time()
+        windows = parse_windows(s.mock_throttle_windows)
+        with self._lock:
+            since = now - s.provider_window_s
+            recent = sum(1 for t, _, _ in self.requests if t > since) + 1
+            in_window = any(a <= self.elapsed(now) < b for a, b in windows)
+            refused = in_window or recent > s.mock_provider_limit
+            self.requests.append((now, kind, refused))
+        if refused:
+            why = ("throttle window" if in_window
+                   else f"{recent} requests in {s.provider_window_s:g}s")
+            raise VendorThrottled(f"[mock] video provider 429 on {kind}: {why}")
+
+    def stats(self) -> dict[str, Any]:
+        s = get_settings()
+        with self._lock:
+            rows = list(self.requests)
+        return {
+            "requests": len(rows),
+            "refused": sum(1 for _, _, r in rows if r),
+            "max_in_any_window": max_in_any_window([t for t, _, _ in rows], s.provider_window_s),
+            "window_s": s.provider_window_s,
+        }
+
+
+#: The one mock video provider for this process.
+VIDEO_PROVIDER = MockVideoProvider()
 
 
 def _task_id(stage: PipelineStage, ctx: JobContext) -> str:
@@ -275,6 +367,7 @@ class MockVideo(VideoStage):
             raise StageFailure("[mock] audio duration missing",
                                code=StageErrorCode.ASSET_MISSING)
         _fail_at_submit(ctx, self.name)
+        VIDEO_PROVIDER.request("submit")  # where the real HTTP call would be
         seconds = Decimal(str(duration_ms)) / 1000
         billed = Decimal(math.ceil(seconds))
         task_id = _task_id(self.name, ctx)
@@ -291,6 +384,7 @@ class MockVideo(VideoStage):
 
     def poll(self, vendor_task_id: str, ctx: JobContext) -> StageResult | None:
         s = get_settings()
+        VIDEO_PROVIDER.request("poll")
         kind = _failure(ctx, self.name)
         if kind == "VENDOR_TIMEOUT" or _age_s(vendor_task_id) < s.mock_video_seconds:
             return None

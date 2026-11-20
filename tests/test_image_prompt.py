@@ -163,6 +163,8 @@ class TestSubmitOrdering:
         sent: dict = {}
 
         class _Resp:
+            status_code = 200
+
             @staticmethod
             def json():
                 return {"code": 200, "data": {"task_id": "t-1"}}

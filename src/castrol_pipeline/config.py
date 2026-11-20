@@ -148,9 +148,35 @@ class Settings(BaseSettings):
     # changes re-burns on its own. This version is for what the hash cannot see.
     card_template_version: str = "v4"
 
+    # Unread: audio is synchronous and runs one at a time on the cycle's
+    # thread, so its concurrency is the thread count.
     max_concurrency_audio: int = 4
-    max_concurrency_image: int = 4
-    max_concurrency_video: int = 10
+    # Enforced since 2026-11-20 (common/pacing.py:in_flight_cap). Both were
+    # declared and never read before then. Video is bounded by the provider's
+    # ~100+ concurrent tasks per account and by its 500 rate climbing with
+    # load; image so a 500-job intake is not 500 edits in flight at once.
+    # 0 means uncapped.
+    max_concurrency_image: int = Field(default=40, ge=0)
+    max_concurrency_video: int = Field(default=60, ge=0)
+
+    # Requests per provider in any rolling `provider_window_s`, submit and poll
+    # together (common/pacing.py). The video provider answers >20 per 10s with
+    # a 429; 15 leaves a margin. The other two have no measured limit, and
+    # these values are far above what either has ever been asked for.
+    video_requests_per_window: int = Field(default=15, ge=1)
+    image_requests_per_window: int = Field(default=15, ge=1)
+    voice_requests_per_window: int = Field(default=10, ge=1)
+    provider_window_s: float = Field(default=10.0, gt=0)
+    # After a 429, nothing goes to that provider for this long.
+    throttle_backoff_s: float = Field(default=15.0, ge=0)
+    # How long a submit or a poll waits for a request slot before giving up
+    # for this tick. Short: the loop has other work, and it comes back.
+    provider_slot_wait_s: float = Field(default=2.0, ge=0)
+    # The least time between two polls of the SAME task. A render takes 8-20
+    # minutes, so checking each one every minute costs 60 tasks one request a
+    # second - two thirds of the video budget - and loses at most a minute.
+    video_poll_interval_s: float = Field(default=60.0, ge=0)
+    image_poll_interval_s: float = Field(default=20.0, ge=0)
     stage_max_attempts: int = Field(default=3, ge=1)
 
     # Seconds a row may sit in `claimed` before the reaper returns it to
@@ -175,6 +201,14 @@ class Settings(BaseSettings):
     #: How long a mock image / video "renders" before its poll returns.
     mock_image_seconds: int = 20
     mock_video_seconds: int = 120
+    #: The mock video provider's own rate limit, enforced the way the real one
+    #: does it: more than this many requests in any `provider_window_s` gets a
+    #: 429. Every request it sees is logged, so a rehearsal can prove the
+    #: pipeline never went over.
+    mock_provider_limit: int = 20
+    #: Stretches, in seconds since the process started, during which the mock
+    #: video provider answers EVERY request with a 429: "300-420,900-960".
+    mock_throttle_windows: str = ""
 
     # The deliver stage POSTs a real URL to the client's real webhook, which is
     # the one irreversible action in the pipeline. It stays OFF and logs what it

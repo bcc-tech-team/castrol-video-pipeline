@@ -349,6 +349,35 @@ a job forever.
 sets status `running`, and releases. The poller reconciles. A worker blocked on
 a 4-minute poll is a worker not doing the other 200 jobs.
 
+**Provider pacing** (2026-11-20, [`common/pacing.py`](../src/castrol_pipeline/common/pacing.py)).
+The video provider refuses more than 20 requests in any 10 seconds with a 429
+and does not queue. Batches 1 and 2 never submitted that fast; the poller did,
+checking every running task back to back. Three things now hold the line:
+
+- **One limiter per provider, per process**, for every request to it -
+  submit, poll and balance check. A sliding window (at most 15 in any 10s by
+  default), not a token bucket: a bucket of N refilled at N per window lets 2N
+  through across a window edge, which is exactly the limit being avoided.
+- **An in-flight cap** (`MAX_CONCURRENCY_VIDEO=60`, `MAX_CONCURRENCY_IMAGE=40`),
+  checked BEFORE the claim in `orchestrator.submit_blocked`, so a capped stage
+  spends no attempt and reserves no budget. The video provider runs ~100+
+  tasks per account, and its 500 rate rose with load: ~30% under 20 in flight,
+  ~90% above 120.
+- **Polls are spaced and sliced.** Each task is polled at most once a minute
+  (`VIDEO_POLL_INTERVAL_S`), least recently polled first, at most 20 per tick.
+  The old `ORDER BY started_at LIMIT 100` never polled the newest tasks once
+  more than 100 were in flight.
+
+**A 429 never fails a run** (`VENDOR_THROTTLED`). On submit the run goes back
+to `pending` with its attempt handed back (`db.release_claim`), because claiming
+took it and nothing was attempted; on poll the task stays `running`. Either way
+the provider's limiter closes for `THROTTLE_BACKOFF_S`. Before this a 429 on
+submit read as `code != 200` and raised VendorRejected, which is terminal.
+Re-sending after a 429 does not cut across invariant 13: that invariant is
+about a submit that MAY have landed, and a 429 is a refusal before the request
+was looked at. The budget reservation taken for it stays counted in
+`vendor_usage`, deliberately, like every other reservation.
+
 ---
 
 ## 8. Vendor budget
