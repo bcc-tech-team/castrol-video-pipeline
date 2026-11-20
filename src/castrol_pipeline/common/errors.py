@@ -39,6 +39,11 @@ class StageErrorCode(StrEnum):
     #: The provider failed on ITS side ("500 internal error, please try again
     #: later") - not a verdict on our inputs, so a later attempt can succeed.
     VENDOR_UNAVAILABLE = "VENDOR_UNAVAILABLE"
+    #: The provider said "too many requests" (HTTP 429, or 429 in the body).
+    #: Not a failure of the run at all: the orchestrator puts the run back
+    #: WITHOUT spending an attempt and closes that provider's limiter for a
+    #: few seconds. It never fails a run and never reaches `retry_delay_for`.
+    VENDOR_THROTTLED = "VENDOR_THROTTLED"
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     ASSET_MISSING = "ASSET_MISSING"
     FFMPEG_FAILED = "FFMPEG_FAILED"
@@ -123,6 +128,14 @@ class VendorTimeout(PipelineError):
 
 class VendorUnavailable(PipelineError):
     code = StageErrorCode.VENDOR_UNAVAILABLE
+
+
+class VendorThrottled(PipelineError):
+    """A 429. The request was refused before it was looked at, so nothing
+    landed and nothing was billed - which is what makes it safe to send again
+    (invariant 13 is about a submit that MAY have landed; this one did not)."""
+
+    code = StageErrorCode.VENDOR_THROTTLED
 
 
 class AssetMissing(PipelineError):

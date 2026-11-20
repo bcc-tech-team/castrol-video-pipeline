@@ -103,6 +103,12 @@ UPSTREAM_STAGES: tuple[PipelineStage, ...] = (
 #: Run by `CompositeWorker`, never by the tick.
 WORKER_STAGES: tuple[PipelineStage, ...] = (PipelineStage.COMPOSITE,)
 
+#: Polls per tick. Each one waits for a slot in its provider's limiter (15 per
+#: 10s on video), so a full sweep of 60 renders in one tick would hold the
+#: loop for ~40s; 20 is ~13s, and every task is still looked at about once a
+#: minute because `video_poll_interval_s` skips those checked recently.
+POLL_SLICE = 20
+
 #: Seconds of upstream work per tick before the loop goes back to polling.
 UPSTREAM_SLICE_S = 15.0
 
@@ -659,7 +665,7 @@ def _work(
             worker.raise_if_failed()
             reap()
 
-            completed = poll_once()
+            completed = poll_once(limit=POLL_SLICE)
             if completed:
                 totals["poll"] = totals.get("poll", 0) + completed
             if stop.is_set():

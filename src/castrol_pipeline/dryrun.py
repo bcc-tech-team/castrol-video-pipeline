@@ -81,9 +81,10 @@ def check_mode_is_safe() -> str:
             problems.append("DELIVERY_ENABLED must be false")
         if problems:
             raise DryRunGuard("Mock mode refused: " + "; ".join(problems))
-        from .stages.mocks import parse_failures
+        from .stages.mocks import parse_failures, parse_windows
 
         parse_failures(s.mock_failures)  # a typo fails here, not mid-batch
+        parse_windows(s.mock_throttle_windows)
         return mode
 
     if mode == "real":

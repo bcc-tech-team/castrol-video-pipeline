@@ -30,6 +30,7 @@ from ..common.errors import (
     StageErrorCode,
     StageFailure,
     VendorRejected,
+    VendorThrottled,
     VendorTimeout,
     VendorUnavailable,
 )
@@ -37,6 +38,40 @@ from ..common.logging import get_logger
 from ..config import get_settings
 
 log = get_logger(__name__)
+
+
+def _is_throttle(status_code: int, body: Any) -> bool:
+    """A 429, as either gateway may spell it. Pure.
+
+    The video provider answers its 20-per-10s limit with HTTP 429; both
+    gateways also return HTTP 200 with the real code in the body (invariant
+    14), so a body `code` of 429 counts the same.
+    """
+    if status_code == 429:
+        return True
+    return isinstance(body, dict) and str(body.get("code", "")).strip() == "429"
+
+
+def _body(r: httpx.Response, what: str) -> dict[str, Any]:
+    """The JSON body, or a throttle, or a retryable INTERNAL failure.
+
+    A 429 is checked BEFORE parsing, because a rate limiter's refusal is often
+    not JSON at all. Anything else unparseable stays what it always was - a
+    retryable INTERNAL - and does not become a terminal rejection by default.
+    """
+    status = int(getattr(r, "status_code", 200))
+    if status == 429:
+        raise VendorThrottled(f"{what}: HTTP 429")
+    try:
+        body = r.json()
+    except ValueError:
+        raise StageFailure(
+            f"{what}: HTTP {status}, body is not JSON: {r.text[:200]!r}",
+            code=StageErrorCode.INTERNAL,
+        ) from None
+    if _is_throttle(status, body):
+        raise VendorThrottled(f"{what}: {json.dumps(body)[:300]}")
+    return body if isinstance(body, dict) else {"data": body}
 
 
 def _sniff_is_image(b: bytes) -> bool:
@@ -110,7 +145,10 @@ def voice_tts(
             },
             json=body,
         )
-    if r.status_code >= 500 or r.status_code == 429:
+    if r.status_code == 429:
+        # Too many requests: put back without spending an attempt.
+        raise VendorThrottled(f"voice provider 429: {r.text[:400]}")
+    if r.status_code >= 500:
         # A bad moment, not an answer about this text. Kept separate from the
         # refusal below because VENDOR_REJECTED is terminal.
         raise VendorTimeout(f"voice provider {r.status_code}: {r.text[:400]}")
@@ -273,8 +311,9 @@ def image_submit(
     # the client raises, and the result is keyed to a task_id nobody recorded.
     # That is a paid call with no way to collect it.
     with httpx.Client(timeout=60.0) as c:
-        j = c.post(f"{_image_base()}/images/generations",
-                   headers=_image_headers(), json=body).json()
+        r = c.post(f"{_image_base()}/images/generations",
+                   headers=_image_headers(), json=body)
+    j = _body(r, "image provider submit")
     if j.get("code") != 200:
         raise VendorRejected(f"image provider submit rejected: {json.dumps(j)[:400]}")
     data = j["data"]
@@ -284,8 +323,9 @@ def image_submit(
 def image_poll(task_id: str) -> str | None:
     """Result URL, or None while still in flight. Raises on vendor failure."""
     with httpx.Client(timeout=60.0) as c:
-        j = c.get(f"{_image_base()}/tasks/{task_id}", headers=_image_headers()).json()
-    d = j.get("data", {})
+        r = c.get(f"{_image_base()}/tasks/{task_id}", headers=_image_headers())
+    j = _body(r, "image provider poll")
+    d = j.get("data") or {}
     status = d.get("status")
 
     if status == "completed":
@@ -384,14 +424,18 @@ def video_submit(
             "20-minute round trip to discover a typo."
         )
     with httpx.Client(timeout=120.0) as c:
-        j = c.post(
+        r = c.post(
             f"{_video_base()}/api/v1/jobs/createTask",
             headers=_video_headers(),
             json={"model": model_id,
                   "input": {"image_url": image_url,
                             "audio_url": audio_url,
                             "prompt": prompt}},
-        ).json()
+        )
+    # A 429 here used to read as `code != 200` and raise VendorRejected, which
+    # is terminal: one burst over the provider's 20-per-10s limit killed the
+    # job outright. It is now VendorThrottled, which puts the run back.
+    j = _body(r, "video provider submit")
     if j.get("code") != 200:
         raise VendorRejected(f"video provider submit rejected: {json.dumps(j)[:400]}")
     return str(j["data"]["taskId"])
@@ -400,9 +444,13 @@ def video_submit(
 def video_poll(task_id: str) -> str | None:
     """Result URL, or None while still in flight. Raises on vendor failure."""
     with httpx.Client(timeout=60.0) as c:
-        j = c.get(f"{_video_base()}/api/v1/jobs/recordInfo",
-                  params={"taskId": task_id}, headers=_video_headers()).json()
-    d = j.get("data", {})
+        r = c.get(f"{_video_base()}/api/v1/jobs/recordInfo",
+                  params={"taskId": task_id}, headers=_video_headers())
+    # A 429 body has no `data`, and used to read as "still in flight" - right
+    # by accident, and silent, so nothing ever slowed down. It is now a
+    # throttle the poller backs off on.
+    j = _body(r, "video provider poll")
+    d = j.get("data") or {}
     state = d.get("state")
 
     if state == "success":
