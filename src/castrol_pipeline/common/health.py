@@ -99,11 +99,15 @@ class ProviderHealth:
 
     # ----------------------------------------------------------- outcomes --
 
-    def record_render(self, *, failed: bool) -> None:
-        """A task this provider finished: a result, or a provider-side 500.
+    def record_verdict(self, *, failed: bool) -> None:
+        """One task's verdict: the provider took it, or it came back a 500.
 
-        Only those two count. A rejection is a verdict on our inputs and says
-        nothing about whether the provider is up.
+        "Took it" is the task still rendering (or done) at its first poll, NOT
+        its completion: a 500 is a "0s render" and a good one takes 8-20
+        minutes, so a breaker fed completions sees nothing but failures for the
+        first ten minutes of every batch. Only those two count. A rejection is
+        a verdict on our inputs and says nothing about whether the provider is
+        up. See `orchestrator._record_outcome`.
         """
         p = self.policy
         with self._lock:

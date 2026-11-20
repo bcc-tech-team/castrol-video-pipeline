@@ -877,10 +877,19 @@ def _note_submit(stage: PipelineStage) -> None:
 
 
 def _record_outcome(stage: PipelineStage, *, failed: bool) -> None:
-    """Feed a finished task to its provider's outage breaker."""
+    """Feed one task's verdict to its provider's outage breaker.
+
+    A task is judged at its FIRST poll - still rendering counts as healthy -
+    and again only if it later fails with a 500. Not at completion: a 500
+    comes back in seconds and a good render in 8-20 minutes, so judging by
+    completions sees a run of failures at the start of every batch before any
+    success can arrive, and pauses an ordinary 50% day. A time-compressed
+    simulation of a 500-video batch caught exactly that
+    (`tests/test_batch_simulation.py`).
+    """
     provider = pacing.STAGE_PROVIDER.get(stage)
     if provider is not None:
-        health.health(provider).record_render(failed=failed)
+        health.health(provider).record_verdict(failed=failed)
 
 
 def _throttled(
@@ -1147,6 +1156,7 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
             continue
         polled += 1
         with _LAST_POLLED_LOCK:
+            first_look = str(run["id"]) not in _LAST_POLLED
             _LAST_POLLED[str(run["id"])] = time.monotonic()
 
         job_id = str(run["job_id"])
@@ -1155,6 +1165,9 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                 ctx = load_context(job_id)
                 result = impl.poll(str(run["vendor_task_id"]), ctx)
                 if result is None:
+                    if first_look:
+                        # Rendering, not refused: the provider took the work.
+                        _record_outcome(stage, failed=False)
                     # Still in flight — unless it has been in flight too long.
                     # The poller is stateless per pass, so without this a task
                     # the vendor silently dropped stays `running` forever: the
@@ -1162,7 +1175,8 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                     _fail_if_overdue(run, stage)
                     continue
                 _persist_result(ctx, run, result)
-                _record_outcome(stage, failed=False)
+                if first_look:
+                    _record_outcome(stage, failed=False)
                 completed += 1
                 log.info("stage.polled_complete", output_key=result.output_key)
             except VendorThrottled as exc:

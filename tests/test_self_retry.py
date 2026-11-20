@@ -62,9 +62,9 @@ class TestOutagePause:
     def test_pauses_when_nearly_every_recent_render_fails(self, events) -> None:
         h, clock = _breaker()
         for _ in range(19):
-            h.record_render(failed=True)
+            h.record_verdict(failed=True)
         assert h.submit_block_reason() is None, "paused on too few samples"
-        h.record_render(failed=True)
+        h.record_verdict(failed=True)
         assert "outage" in (h.submit_block_reason() or "")
         assert [n for n, _ in events] == ["provider.outage_paused"]
 
@@ -75,14 +75,14 @@ class TestOutagePause:
         h, clock = _breaker()
         for i in range(2000):
             clock.t += 1
-            h.record_render(failed=i % 2 == 0)
+            h.record_verdict(failed=i % 2 == 0)
         assert h.state == health.CLOSED
         assert events == []
 
     def test_after_the_pause_two_probes_go_out_then_it_waits(self, events) -> None:
         h, clock = _breaker(pause_s=300, probes=2)
         for _ in range(20):
-            h.record_render(failed=True)
+            h.record_verdict(failed=True)
         clock.t += 299
         assert h.submit_block_reason()
         clock.t += 2
@@ -96,11 +96,11 @@ class TestOutagePause:
     def test_a_probe_that_renders_ends_the_outage(self, events) -> None:
         h, clock = _breaker(pause_s=300)
         for _ in range(20):
-            h.record_render(failed=True)
+            h.record_verdict(failed=True)
         clock.t += 301
         h.submit_block_reason()
         h.note_submit()
-        h.record_render(failed=False)
+        h.record_verdict(failed=False)
         assert h.state == health.CLOSED
         assert h.outage_since is None
         assert h.submit_block_reason() is None
@@ -109,11 +109,11 @@ class TestOutagePause:
     def test_a_probe_that_fails_pauses_again_for_longer(self, events) -> None:
         h, clock = _breaker(pause_s=300, max_pause_s=1800)
         for _ in range(20):
-            h.record_render(failed=True)
+            h.record_verdict(failed=True)
         started = h.outage_since
         clock.t += 301
         h.submit_block_reason()
-        h.record_render(failed=True)
+        h.record_verdict(failed=True)
         assert h.state == health.PAUSED
         clock.t += 301
         assert h.submit_block_reason(), "the second pause should be 600s"
@@ -126,8 +126,8 @@ class TestOutagePause:
     def test_renders_still_landing_during_a_pause_decide_nothing(self, events) -> None:
         h, clock = _breaker()
         for _ in range(20):
-            h.record_render(failed=True)
-        h.record_render(failed=False)  # a straggler from before the pause
+            h.record_verdict(failed=True)
+        h.record_verdict(failed=False)  # a straggler from before the pause
         assert h.state == health.PAUSED
 
 
@@ -385,3 +385,46 @@ class TestMockRenderFailures:
         t0 = int(p.epoch)
         assert all(mocks.render_500(f"mock-video-{t0 + i}-j") for i in range(1, 500, 7))
         assert not mocks.render_500(f"mock-video-{t0 + 700}-j")
+
+
+class TestBreakerIsFedAtFirstPoll:
+    """A 500 is a "0s render"; a good render takes 8-20 minutes. Judged at
+    completion, the first twenty outcomes of every batch are failures and an
+    ordinary 50% day pauses - which the batch simulation caught."""
+
+    def _poll(self, monkeypatch, answer):
+        verdicts: list[bool] = []
+        monkeypatch.setattr(orchestrator, "_record_outcome",
+                            lambda stage, *, failed: verdicts.append(failed))
+
+        class Video:
+            is_async = True
+
+            def poll(self, task_id, ctx):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+        monkeypatch.setattr(orchestrator, "get_stage_registry", lambda: {S.VIDEO: Video()})
+        row = {"id": "r1", "job_id": "00000000-0000-0000-0000-000000000001",
+               "stage": "video", "vendor_task_id": "t1", "attempts": 1,
+               "started_at": datetime.now(UTC)}
+        monkeypatch.setattr(orchestrator.db, "fetch_all", lambda *a, **k: [row])
+        monkeypatch.setattr(orchestrator.db, "mark_failed", lambda *a, **k: None)
+        monkeypatch.setattr(orchestrator, "load_context", lambda j: object())
+        monkeypatch.setattr(orchestrator, "record_event", lambda *a, **k: None)
+        monkeypatch.setattr(orchestrator, "schedule_ready", lambda *a, **k: [])
+        monkeypatch.setattr(orchestrator, "advance_job", lambda *a, **k: None)
+        monkeypatch.setattr(orchestrator, "_poll_interval", lambda stage: 0.0)
+        orchestrator.poll_once()
+        orchestrator.poll_once()
+        return verdicts
+
+    def test_still_rendering_at_the_first_look_counts_as_taken_once(self, monkeypatch):
+        assert self._poll(monkeypatch, None) == [False]
+
+    def test_a_500_counts_as_failed(self, monkeypatch):
+        from castrol_pipeline.common.errors import VendorUnavailable
+
+        verdicts = self._poll(monkeypatch, VendorUnavailable("500"))
+        assert verdicts and all(verdicts)
