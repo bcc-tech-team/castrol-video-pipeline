@@ -171,6 +171,8 @@ def quiet_cycle(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(orchestrator, "_checked_mode", lambda: "real")
     monkeypatch.setattr(orchestrator, "reap", lambda: 0)
+    monkeypatch.setattr(orchestrator, "credits_preflight", lambda: None)
+    monkeypatch.setattr(orchestrator, "release_due_failures", lambda: {})
     monkeypatch.setattr(orchestrator, "drain_stage", lambda stage: 0)
     # The upstream slice and the composite worker thread both claim through
     # execute_one. False is an empty queue.

@@ -15,6 +15,13 @@ const BY_CODE: Record<string, string> = {
   // A provider-side outage, retried automatically. Before this code existed
   // such failures were VENDOR_REJECTED and read as a rejected photo.
   VENDOR_UNAVAILABLE: "The video service had a temporary outage. It will be retried.",
+  // Neither of these fails a job - both put the work back and pause - so
+  // they should never reach this page. Here so that if one ever does, it
+  // reads as a pause and not as the generic failure line.
+  VENDOR_THROTTLED: "The video service was busy. It will be retried.",
+  // Deliberately says nothing about credits, cost or who the provider is:
+  // this panel is the client's, and the balance is ours to top up.
+  VENDOR_OUT_OF_CREDITS: "Processing is paused and will resume automatically.",
   BUDGET_EXHAUSTED: "The daily processing limit was reached.",
   ASSET_MISSING: "A required file was missing.",
   FFMPEG_FAILED: "The final video could not be assembled.",

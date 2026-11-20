@@ -47,6 +47,12 @@ USD_PER_IMAGE_2K = Decimal("0.014")               # image provider, gpt-image-2 
 USD_PER_VIDEO_SECOND_STANDARD = Decimal("0.036")  # video provider, kling/ai-avatar-standard
 USD_PER_VIDEO_SECOND_PRO = Decimal("0.072")       # kling/ai-avatar-pro
 
+#: The video provider reports its balance in its own credits. Measured
+#: 2026-09-14, not inferred: nine standard renders billing 250 output seconds
+#: consumed exactly 1864 credits, which at $0.036/s is ~207 per USD. The older
+#: 166 came from reading a refusal message and was wrong by a quarter.
+VIDEO_CREDITS_PER_USD = Decimal("207")
+
 #: The voice provider bills 1 credit per CHARACTER, 100K credits per $5. Per character,
 #: not per block: there is no kilochar rounding to apply. An earlier $0.10 per
 #: 1000 chars figure came from another stack's internal credit conversion and

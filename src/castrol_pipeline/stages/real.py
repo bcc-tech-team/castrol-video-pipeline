@@ -504,6 +504,10 @@ class VideoStage:
             billed_seconds=billed,
         )
 
+    def balance_usd(self) -> float:
+        """The account balance in USD - one paced request, made by the caller."""
+        return vendors.video_balance_usd()
+
     def poll(self, vendor_task_id: str, ctx: JobContext) -> StageResult | None:
         url = vendors.video_poll(vendor_task_id)
         if url is None:

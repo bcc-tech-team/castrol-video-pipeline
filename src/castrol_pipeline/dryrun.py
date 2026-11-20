@@ -84,7 +84,9 @@ def check_mode_is_safe() -> str:
         from .stages.mocks import parse_failures, parse_windows
 
         parse_failures(s.mock_failures)  # a typo fails here, not mid-batch
-        parse_windows(s.mock_throttle_windows)
+        for spec in (s.mock_throttle_windows, s.mock_no_credits_windows,
+                     s.mock_outage_windows):
+            parse_windows(spec)
         return mode
 
     if mode == "real":

@@ -17,18 +17,19 @@ import socket
 import threading
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 from psycopg.types.json import Jsonb
 
-from .common import db, pacing
+from .common import budget, db, health, pacing
 from .common.errors import (
     TERMINAL_STAGE_ERRORS,
     PipelineError,
     StageErrorCode,
+    VendorOutOfCredits,
     VendorThrottled,
 )
 from .common.events import record_event
@@ -114,9 +115,38 @@ def retry_delay_for(attempts: int, code: StageErrorCode) -> int | None:
     """
     if code in TERMINAL_STAGE_ERRORS:
         return None
+    if code == StageErrorCode.VENDOR_UNAVAILABLE:
+        return unavailable_delay(attempts)
     if attempts >= get_settings().stage_max_attempts:
         return None
     return backoff_seconds(attempts)
+
+
+def unavailable_backoff() -> list[int]:
+    """The VENDOR_UNAVAILABLE schedule, in seconds per attempt. The last repeats."""
+    raw = get_settings().unavailable_backoff_s
+    steps = [int(float(x)) for x in raw.split(",") if x.strip()]
+    if not steps or any(s <= 0 for s in steps):
+        raise ValueError(f"UNAVAILABLE_BACKOFF_S must be positive seconds: {raw!r}")
+    return steps
+
+
+def unavailable_delay(attempts: int) -> int | None:
+    """Backoff for a provider-side 500, on its own long budget.
+
+    Batches 1 and 2: 46% of renders came back "500 internal error, please try
+    again later", in windows, and every affected job rendered in the end - but
+    only after four rounds of `castrol retry-failed` by hand, because three
+    attempts at 30s and 60s are over inside two minutes and these windows last
+    hours. 1, 2, 4, 8, 15 then 30 minutes across 12 attempts rides out 3.5
+    hours of backoff, plus the renders themselves. A failed render refunds,
+    so the money is not at stake; the reservations against `vendor_usage`
+    are, which is why it is still bounded.
+    """
+    if attempts >= get_settings().unavailable_max_attempts:
+        return None
+    steps = unavailable_backoff()
+    return steps[min(max(attempts - 1, 0), len(steps) - 1)]
 
 
 # ------------------------------------------------------------------ context --
@@ -201,17 +231,72 @@ def ready_stages(job_id: str, done: dict[str, dict[str, Any]] | None = None) -> 
 
 
 def latest_runs(job_id: str) -> dict[str, dict[str, Any]]:
-    """The newest run per stage, whatever its status. `skipped` is history, not state."""
+    """The newest run per stage, whatever its status. `skipped` is history, not state.
+
+    `lifetime_attempts` is the attempts summed over every run of that stage at
+    the newest run's inputs - what the auto-release cap counts. Per input hash,
+    so a changed prompt starts a fresh budget, exactly as it releases the hold.
+    """
     rows = db.fetch_all(
         """
-        SELECT DISTINCT ON (stage) stage, status, input_hash, error_code, finished_at
-          FROM stage_runs
-         WHERE job_id = %(job_id)s AND status <> 'skipped'
+        SELECT DISTINCT ON (stage) id, stage, status, input_hash, error_code,
+               finished_at, lifetime_attempts
+          FROM (SELECT *, sum(attempts) OVER (PARTITION BY stage, input_hash)
+                          AS lifetime_attempts
+                  FROM stage_runs
+                 WHERE job_id = %(job_id)s AND status <> 'skipped') runs
          ORDER BY stage, created_at DESC;
         """,
         {"job_id": job_id},
     )
     return {str(r["stage"]): r for r in rows}
+
+
+#: What `failure_decision` can say about a stage's latest run.
+NO_FAILURE = "none"      # nothing failed, or the failure is about other inputs
+HOLD = "hold"            # a terminal failure stands
+RELEASE = "release"      # a provider-outage failure has cooled off: try again
+CAPPED = "capped"        # a provider-outage failure past its lifetime cap
+
+
+def failure_decision(
+    latest: dict[str, Any] | None, input_hash: str, *, now: datetime | None = None
+) -> str:
+    """`failure_holds`, with the reason. Pure.
+
+    VENDOR_UNAVAILABLE is the one failure that releases ITSELF. It is the
+    provider failing on its own side, not a verdict on our inputs, and every
+    job Batches 1 and 2 lost to it rendered in the end - after four rounds of
+    `castrol retry-failed` by hand. Once its own 12 attempts are spent the
+    failure holds for `UNAVAILABLE_RELEASE_AFTER_S`, then releases with a fresh
+    run, until the attempts summed over every run at these inputs reach
+    `UNAVAILABLE_LIFETIME_ATTEMPTS` (24). Past that it is CAPPED: held for a
+    person, and `release_due_failures` raises it.
+    """
+    if latest is None or str(latest["status"]) != "failed":
+        return NO_FAILURE
+    if latest["input_hash"] != input_hash:
+        return NO_FAILURE
+    now = now or datetime.now(UTC)
+    s = get_settings()
+    code = latest["error_code"]
+    finished = latest["finished_at"]
+    if code == str(StageErrorCode.BUDGET_EXHAUSTED):
+        if finished is None:
+            return HOLD
+        tz = ZoneInfo(s.export_timezone)
+        today = now.astimezone(tz).date()
+        return HOLD if finished.astimezone(tz).date() >= today else NO_FAILURE
+    if code == str(StageErrorCode.VENDOR_UNAVAILABLE):
+        lifetime = int(latest.get("lifetime_attempts") or 0)
+        if lifetime >= s.unavailable_lifetime_attempts:
+            return CAPPED
+        if finished is None:
+            return HOLD
+        if (now - finished).total_seconds() < s.unavailable_release_after_s:
+            return HOLD
+        return RELEASE
+    return HOLD
 
 
 def failure_holds(
@@ -231,21 +316,12 @@ def failure_holds(
       * the inputs changed — a new prompt or plate is a different question
       * it was BUDGET_EXHAUSTED on an earlier IST day — the cap is per day
         (`vendor_usage.usage_date`), so the stop is for the day, not forever
+      * it was VENDOR_UNAVAILABLE, has cooled off, and is under its lifetime
+        attempt cap (`failure_decision`)
 
     Everything else waits for a person: `castrol run <ref> --retry`.
     """
-    if latest is None or str(latest["status"]) != "failed":
-        return False
-    if latest["input_hash"] != input_hash:
-        return False
-    if latest["error_code"] == str(StageErrorCode.BUDGET_EXHAUSTED):
-        finished = latest["finished_at"]
-        if finished is None:
-            return True
-        tz = ZoneInfo(get_settings().export_timezone)
-        today = (now or datetime.now(UTC)).astimezone(tz).date()
-        return finished.astimezone(tz).date() >= today
-    return True
+    return failure_decision(latest, input_hash, now=now) in (HOLD, CAPPED)
 
 
 def schedule_ready(job_id: str, *, retry_failed: bool = False) -> list[PipelineStage]:
@@ -274,11 +350,26 @@ def schedule_ready(job_id: str, *, retry_failed: bool = False) -> list[PipelineS
             # makes a re-run after a code change redo only what actually moved.
             continue
 
-        if not retry_failed and failure_holds(latest.get(str(stage)), input_hash):
+        prior = latest.get(str(stage))
+        decision = failure_decision(prior, input_hash)
+        if not retry_failed and decision in (HOLD, CAPPED):
             continue
 
         if db.enqueue_stage_run(job_id, str(stage), input_hash):
             enqueued.append(stage)
+            if decision == RELEASE and not retry_failed and prior is not None:
+                # Durable, because a self-healing system that heals silently
+                # is one nobody can tell from a lucky one.
+                record_event(
+                    "job.auto_retry",
+                    job_id=job_id,
+                    stage=str(stage),
+                    stage_run_id=str(prior["id"]),
+                    level="warning",
+                    error_code=prior["error_code"],
+                    lifetime_attempts=int(prior.get("lifetime_attempts") or 0),
+                    lifetime_cap=get_settings().unavailable_lifetime_attempts,
+                )
 
     if enqueued:
         log.info("orchestrator.scheduled", job_id=job_id, stages=[str(s) for s in enqueued])
@@ -578,12 +669,218 @@ def submit_blocked(stage: PipelineStage) -> str | None:
     """Why no new run of `stage` may be sent right now, or None if one may.
 
     Asked BEFORE claiming, so a blocked stage spends no attempt and reserves
-    no budget. Today that is the in-flight cap (`pacing.in_flight_cap`).
+    no budget. Three reasons, in order: the provider is out of credits, the
+    provider is in an outage pause (`common/health.py`), or the in-flight cap
+    (`pacing.in_flight_cap`) is full. While paused for credits this is also
+    where the balance is re-checked, so every caller - the cycle, `castrol
+    run`, `castrol work` - resumes by itself.
     """
+    provider = pacing.STAGE_PROVIDER.get(stage)
+    if provider is not None:
+        h = health.health(provider)
+        if h.balance_check_due():
+            _recheck_balance(stage, h)
+        reason = h.submit_block_reason()
+        if reason:
+            return reason
     cap = pacing.in_flight_cap(stage)
     if cap is not None and db.count_in_flight(str(stage)) >= cap:
         return f"{cap} {stage} runs already in flight"
     return None
+
+
+# ----------------------------------------------------------------- credits --
+
+
+def expected_render_spend() -> dict[str, Any]:
+    """What the renders still owed would cost, at today's rate.
+
+    Owed means: a job that is not finished, failed or cancelled and has no
+    video run succeeded or in flight - a render in flight was paid for at
+    submit (invariant 24). Priced from the job's probed audio where there is
+    one, and from `RENDER_SECONDS_ESTIMATE` where the voice is not made yet.
+    """
+    s = get_settings()
+    rows = db.fetch_all(
+        """
+        SELECT (SELECT a.duration_ms FROM assets a
+                 WHERE a.job_id = j.id AND a.kind = 'audio'
+                 ORDER BY a.created_at DESC LIMIT 1) AS audio_ms
+          FROM jobs j
+         WHERE j.status NOT IN ('completed', 'cancelled', 'failed')
+           AND NOT EXISTS (SELECT 1 FROM stage_runs r
+                            WHERE r.job_id = j.id AND r.stage = 'video'
+                              AND r.status IN ('succeeded', 'running'));
+        """
+    )
+    per_render = budget.video_cost_usd(s.render_seconds_estimate, pro=s.video_is_pro)
+    total = sum(
+        (budget.video_cost_usd(r["audio_ms"] / 1000, pro=s.video_is_pro)
+         if r.get("audio_ms") else per_render)
+        for r in rows
+    )
+    return {"renders": len(rows), "usd": float(total), "per_render_usd": float(per_render)}
+
+
+def balance_usd(stage: PipelineStage = PipelineStage.VIDEO) -> float | None:
+    """The provider's balance in USD, paced like any other request.
+
+    None when the stage has no balance to read (stub mode, the image and
+    voice providers) or when no request slot came free.
+    """
+    fn = getattr(get_stage_registry().get(stage), "balance_usd", None)
+    if fn is None:
+        return None
+    gate = pacing.limiter_for(stage)
+    if gate is not None and not gate.acquire(get_settings().provider_slot_wait_s):
+        return None
+    return float(fn())
+
+
+def _recheck_balance(stage: PipelineStage, h: health.ProviderHealth) -> None:
+    """Paused for credits: has a top-up landed that covers the work?
+
+    "The work" is the renders owed, but no more than one full set of render
+    slots: a top-up big enough to fill the in-flight cap resumes the batch
+    rather than waiting for the whole of a 500-video queue to be covered. A
+    queue the balance does not cover is the `credits_low` alert's business.
+    A provider with no balance endpoint resumes on the recheck timer, and the
+    next submit is the test.
+    """
+    try:
+        balance = balance_usd(stage)
+    except Exception as exc:  # noqa: BLE001 - an unreadable balance is "not yet"
+        log.warning("provider.balance_unreadable", stage=str(stage), error=str(exc)[:300])
+        h.balance_checked(covered=False, balance_usd=None, needed_usd=0.0)
+        return
+    if balance is None and getattr(get_stage_registry().get(stage), "balance_usd", None):
+        return  # no request slot this time; still due, so the next ask retries
+    if balance is None:
+        h.balance_checked(covered=True, balance_usd=None, needed_usd=0.0)
+        return
+    spend = expected_render_spend()
+    cap = pacing.in_flight_cap(stage) or spend["renders"] or 1
+    needed = min(spend["usd"], cap * spend["per_render_usd"])
+    needed = max(needed, spend["per_render_usd"])
+    h.balance_checked(covered=balance >= needed, balance_usd=round(balance, 2),
+                      needed_usd=round(needed, 2))
+
+
+def credits_preflight() -> dict[str, Any] | None:
+    """At cycle start: does the balance cover the renders queued?
+
+    Recorded as a warning when it does not, so a batch that will run dry in
+    the middle of the night says so before it starts rather than at the 402.
+    None when there is no balance to read.
+    """
+    try:
+        balance = balance_usd(PipelineStage.VIDEO)
+    except Exception as exc:  # noqa: BLE001 - a preflight never stops a cycle
+        log.warning("cycle.balance_unreadable", error=str(exc)[:300])
+        return {"error": str(exc)[:300]}
+    if balance is None:
+        return None
+    spend = expected_render_spend()
+    out = {"balance_usd": round(balance, 2), "needed_usd": round(spend["usd"], 2),
+           "renders": spend["renders"], "short": balance < spend["usd"]}
+    if out["short"]:
+        log.warning("cycle.credits_short", **out)
+        record_event("cycle.credits_short", level="warning", **out)
+    return out
+
+
+# ----------------------------------------------------- self-releasing holds --
+
+
+_RELEASABLE_SQL = """
+SELECT job_id, stage, id, finished_at, lifetime_attempts
+  FROM (SELECT DISTINCT ON (job_id, stage) job_id, stage, id, status, error_code,
+               finished_at, lifetime_attempts
+          FROM (SELECT *, sum(attempts) OVER (PARTITION BY job_id, stage, input_hash)
+                          AS lifetime_attempts
+                  FROM stage_runs
+                 WHERE status <> 'skipped') runs
+         ORDER BY job_id, stage, created_at DESC) latest
+ WHERE status = 'failed' AND error_code = %(code)s;
+"""
+
+
+def unavailable_failures() -> list[dict[str, Any]]:
+    """Every (job, stage) whose latest run is a terminal provider-500 failure."""
+    return db.fetch_all(_RELEASABLE_SQL, {"code": str(StageErrorCode.VENDOR_UNAVAILABLE)})
+
+
+def pending_releases(
+    rows: list[dict[str, Any]] | None = None, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """How many failures will release themselves later, and when the next one is.
+
+    The cycle counts these as outstanding work, so it waits for them instead
+    of ending and leaving them for the next timer twelve hours away.
+    """
+    s = get_settings()
+    rows = unavailable_failures() if rows is None else rows
+    due = [r["finished_at"] + timedelta(seconds=s.unavailable_release_after_s)
+           for r in rows
+           if int(r["lifetime_attempts"] or 0) < s.unavailable_lifetime_attempts
+           and r["finished_at"] is not None]
+    return {"count": len(due), "next_due": min(due) if due else None}
+
+
+def release_due_failures(*, now: datetime | None = None) -> dict[str, int]:
+    """Re-enqueue provider-500 failures that have cooled off; flag the capped.
+
+    `schedule_ready` does the releasing (and records `job.auto_retry`), so a
+    job is released here by exactly the rule that would release it at the
+    next cycle start. A capped failure is recorded ONCE, as
+    `job.attempt_cap_reached` against its run, for a person to look at.
+    """
+    now = now or datetime.now(UTC)
+    s = get_settings()
+    out = {"released": 0, "capped": 0}
+    for row in unavailable_failures():
+        job_id = str(row["job_id"])
+        if int(row["lifetime_attempts"] or 0) >= s.unavailable_lifetime_attempts:
+            seen = db.fetch_one(
+                """
+                SELECT 1 AS seen FROM job_events
+                 WHERE stage_run_id = %(run)s AND event = 'job.attempt_cap_reached'
+                 LIMIT 1;
+                """,
+                {"run": str(row["id"])},
+            )
+            if not seen:
+                out["capped"] += 1
+                record_event(
+                    "job.attempt_cap_reached",
+                    job_id=job_id,
+                    stage=str(row["stage"]),
+                    stage_run_id=str(row["id"]),
+                    level="error",
+                    lifetime_attempts=int(row["lifetime_attempts"]),
+                    lifetime_cap=s.unavailable_lifetime_attempts,
+                )
+            continue
+        finished = row["finished_at"]
+        if finished is None or (now - finished).total_seconds() < s.unavailable_release_after_s:
+            continue
+        if schedule_ready(job_id):
+            advance_job(job_id)
+            out["released"] += 1
+    return out
+
+
+def _note_submit(stage: PipelineStage) -> None:
+    provider = pacing.STAGE_PROVIDER.get(stage)
+    if provider is not None:
+        health.health(provider).note_submit()
+
+
+def _record_outcome(stage: PipelineStage, *, failed: bool) -> None:
+    """Feed a finished task to its provider's outage breaker."""
+    provider = pacing.STAGE_PROVIDER.get(stage)
+    if provider is not None:
+        health.health(provider).record_render(failed=failed)
 
 
 def _throttled(
@@ -655,6 +952,7 @@ def execute_one(
                     billed_units=outcome.billed_units,
                 )
                 log.info("stage.submitted", vendor_task_id=outcome.vendor_task_id)
+                _note_submit(stage)
                 return True
 
             _persist_result(ctx, run, outcome)
@@ -669,6 +967,16 @@ def execute_one(
             _throttled(stage, exc, job_id=job_id, run_id=run_id, on="submit")
             db.release_claim(run_id, delay_seconds=get_settings().throttle_backoff_s,
                              reason=str(exc)[:500])
+            return False
+
+        except VendorOutOfCredits as exc:
+            # Not this job's fault, and not something a retry fixes. Put the
+            # run back untouched and stop sending this provider anything until
+            # the balance covers the work again (`submit_blocked`).
+            db.release_claim(run_id, delay_seconds=0, reason=str(exc)[:500])
+            provider = pacing.STAGE_PROVIDER.get(stage)
+            if provider is not None:
+                health.health(provider).pause_for_credits(str(exc))
             return False
 
         except Exception as exc:  # noqa: BLE001 - the orchestrator is the boundary
@@ -854,6 +1162,7 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                     _fail_if_overdue(run, stage)
                     continue
                 _persist_result(ctx, run, result)
+                _record_outcome(stage, failed=False)
                 completed += 1
                 log.info("stage.polled_complete", output_key=result.output_key)
             except VendorThrottled as exc:
@@ -885,6 +1194,8 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                 _fail_if_overdue(run, stage)
             except Exception as exc:  # noqa: BLE001
                 code = exc.code if isinstance(exc, PipelineError) else StageErrorCode.INTERNAL
+                if code == StageErrorCode.VENDOR_UNAVAILABLE:
+                    _record_outcome(stage, failed=True)
                 delay = retry_delay_for(int(run["attempts"]), code)
                 db.mark_failed(
                     str(run["id"]),

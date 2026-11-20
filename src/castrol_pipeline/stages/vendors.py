@@ -29,6 +29,7 @@ from ..common.errors import (
     PipelineError,
     StageErrorCode,
     StageFailure,
+    VendorOutOfCredits,
     VendorRejected,
     VendorThrottled,
     VendorTimeout,
@@ -52,6 +53,20 @@ def _is_throttle(status_code: int, body: Any) -> bool:
     return isinstance(body, dict) and str(body.get("code", "")).strip() == "429"
 
 
+def _is_out_of_credits(status_code: int, body: Any) -> bool:
+    """A 402, or the gateway's "Credits insufficient" in a 200 body. Pure."""
+    if status_code == 402:
+        return True
+    if not isinstance(body, dict):
+        return False
+    if str(body.get("code", "")).strip() == "402":
+        return True
+    if body.get("code") == 200:
+        return False
+    msg = str(body.get("msg") or body.get("message") or "").lower()
+    return "insufficient" in msg and ("credit" in msg or "balance" in msg)
+
+
 def _body(r: httpx.Response, what: str) -> dict[str, Any]:
     """The JSON body, or a throttle, or a retryable INTERNAL failure.
 
@@ -62,6 +77,8 @@ def _body(r: httpx.Response, what: str) -> dict[str, Any]:
     status = int(getattr(r, "status_code", 200))
     if status == 429:
         raise VendorThrottled(f"{what}: HTTP 429")
+    if status == 402:
+        raise VendorOutOfCredits(f"{what}: HTTP 402 {r.text[:200]}")
     try:
         body = r.json()
     except ValueError:
@@ -71,6 +88,8 @@ def _body(r: httpx.Response, what: str) -> dict[str, Any]:
         ) from None
     if _is_throttle(status, body):
         raise VendorThrottled(f"{what}: {json.dumps(body)[:300]}")
+    if _is_out_of_credits(status, body):
+        raise VendorOutOfCredits(f"{what}: {json.dumps(body)[:300]}")
     return body if isinstance(body, dict) else {"data": body}
 
 
@@ -467,6 +486,36 @@ def video_poll(task_id: str) -> str | None:
         raise video_task_failure(state, d)
 
     return None
+
+
+def video_balance_usd() -> float:
+    """The video account's balance, in USD.
+
+    The provider answers in its own credits; `budget.VIDEO_CREDITS_PER_USD`
+    is the measured rate. Read defensively, because the shape of `data` is not
+    documented: a bare number, or a dict holding one under a credit-ish key.
+    Anything else raises, and the caller treats an unreadable balance as "not
+    covered yet" rather than guessing.
+    """
+    from ..common.budget import VIDEO_CREDITS_PER_USD
+
+    with httpx.Client(timeout=30.0) as c:
+        r = c.get(f"{_video_base()}/api/v1/chat/credit", headers=_video_headers())
+    j = _body(r, "video provider balance")
+    data = j.get("data")
+    if isinstance(data, dict):
+        for key in ("credit", "credits", "balance", "remainCredits", "remaining"):
+            if key in data:
+                data = data[key]
+                break
+    try:
+        credits = float(data)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise StageFailure(
+            f"video provider balance unreadable: {json.dumps(j)[:200]}",
+            code=StageErrorCode.INTERNAL,
+        ) from None
+    return credits / float(VIDEO_CREDITS_PER_USD)
 
 
 def video_task_failure(state: str, data: dict[str, Any]) -> PipelineError:

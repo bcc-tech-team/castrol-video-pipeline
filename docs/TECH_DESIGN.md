@@ -368,6 +368,26 @@ checking every running task back to back. Three things now hold the line:
   The old `ORDER BY started_at LIMIT 100` never polled the newest tasks once
   more than 100 were in flight.
 
+**Self-retry** (2026-11-20). Batches 1 and 2: 503 of 1,094 video submits (46%)
+came back "500 internal error, please try again later", in windows (0% at
+12:00–14:00 IST on 2026-10-23, 84% at 23:00), and every affected job rendered in
+the end - after four rounds of `castrol retry-failed` by hand, and a credit
+run-out that killed every job it touched. Three mechanisms replace the person:
+
+| | trigger | what happens | ends |
+|---|---|---|---|
+| long retry | `VENDOR_UNAVAILABLE` | 12 attempts, backoff 1/2/4/8/15/30 min (3.5 h) | success, or a terminal failure |
+| self-release | that terminal failure, 30 min old | `failure_decision` → RELEASE, a fresh run, `job.auto_retry` | 24 attempts summed over every run at those inputs → CAPPED, `job.attempt_cap_reached` |
+| outage pause | ≥90% of the last 20-30 render outcomes are 500s | video submits stop 5 min, then 2 probes | a probe renders; a failed probe doubles the pause (cap 30 min) |
+| credits pause | 402 / "Credits insufficient" | run put back, attempt returned, every video submit stops | the balance covers the renders owed, capped at one full set of slots |
+
+Invariant 34 is relaxed for exactly the self-release case; the rest of it
+stands. Both pauses gate SUBMITS in `orchestrator.submit_blocked`, before the
+claim, so a paused provider costs no attempts and no reservations, and polling
+carries on. The breaker and the credits state are in memory per process
+([`common/health.py`](../src/castrol_pipeline/common/health.py)); a restart
+forgets a pause and relearns it from the next few outcomes.
+
 **A 429 never fails a run** (`VENDOR_THROTTLED`). On submit the run goes back
 to `pending` with its attempt handed back (`db.release_claim`), because claiming
 took it and nothing was attempted; on poll the task stays `running`. Either way

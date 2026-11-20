@@ -112,6 +112,8 @@ def world(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(cycle, "next_sleep", lambda *a, **k: 0.01)
         monkeypatch.setattr(orchestrator, "_checked_mode", lambda: "mock")
         monkeypatch.setattr(orchestrator, "reap", lambda: 0)
+        monkeypatch.setattr(orchestrator, "credits_preflight", lambda: None)
+        monkeypatch.setattr(orchestrator, "release_due_failures", lambda: {})
         monkeypatch.setattr(orchestrator, "execute_one", fake.execute_one)
         monkeypatch.setattr(orchestrator, "drain_stage", fake.drain_stage)
         monkeypatch.setattr(orchestrator, "poll_once", fake.poll_once)

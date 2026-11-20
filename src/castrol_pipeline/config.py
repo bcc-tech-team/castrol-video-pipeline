@@ -179,6 +179,38 @@ class Settings(BaseSettings):
     image_poll_interval_s: float = Field(default=20.0, ge=0)
     stage_max_attempts: int = Field(default=3, ge=1)
 
+    # ------------------------------------------------------- self-retry --
+    # A provider-side 500 (VENDOR_UNAVAILABLE) gets its own, longer budget.
+    # Failed renders refund (invariant 24), so the money is not at stake, but
+    # every attempt is a `vendor_usage` reservation, so it stays bounded.
+    # Backoff in seconds per attempt, the last value repeating:
+    # 1, 2, 4, 8, 15, then 30 minutes: 12 attempts, 3.5 hours of backoff.
+    unavailable_max_attempts: int = Field(default=12, ge=1)
+    unavailable_backoff_s: str = "60,120,240,480,900,1800"
+    # When those run out the failure holds for this long, then releases itself
+    # with a fresh run (orchestrator.failure_decision) - until the attempts
+    # summed over every run of that stage at those inputs reach the lifetime
+    # cap. Past that it is a person's call, and an alert says so.
+    unavailable_release_after_s: int = Field(default=1800, ge=0)
+    unavailable_lifetime_attempts: int = Field(default=24, ge=1)
+
+    # The outage pause (common/health.py). Judged on the last `outage_window`
+    # render outcomes no older than `outage_max_age_s`; pauses when at least
+    # `outage_fail_share` of them were provider 500s.
+    outage_window: int = Field(default=30, ge=1)
+    outage_min_samples: int = Field(default=20, ge=1)
+    outage_max_age_s: float = Field(default=1200, gt=0)
+    outage_fail_share: float = Field(default=0.9, gt=0, le=1)
+    outage_pause_s: float = Field(default=300, ge=0)
+    outage_max_pause_s: float = Field(default=1800, ge=0)
+    outage_probes: int = Field(default=2, ge=1)
+
+    # While paused for credits, how often the balance endpoint is asked.
+    credits_recheck_s: float = Field(default=300, ge=1)
+    # Render length assumed for a job whose audio is not made yet, when
+    # pricing the queue against the balance. The real script runs 26-30s.
+    render_seconds_estimate: float = Field(default=30, gt=0)
+
     # Seconds a row may sit in `claimed` before the reaper returns it to
     # `pending`. A worker OOM without this parks a job forever.
     stage_claim_timeout_s: int = 900
@@ -209,6 +241,14 @@ class Settings(BaseSettings):
     #: Stretches, in seconds since the process started, during which the mock
     #: video provider answers EVERY request with a 429: "300-420,900-960".
     mock_throttle_windows: str = ""
+    #: Stretches during which the mock video provider is out of credits: every
+    #: submit answers 402 and the balance reads zero.
+    mock_no_credits_windows: str = ""
+    #: Percent of mock render ATTEMPTS that fail as a provider-side 500 -
+    #: per attempt, not per job, so a retry can succeed, as the real ones did.
+    mock_render_500_percent: int = Field(default=0, ge=0, le=100)
+    #: Stretches during which EVERY mock render fails with a 500: an outage.
+    mock_outage_windows: str = ""
 
     # The deliver stage POSTs a real URL to the client's real webhook, which is
     # the one irreversible action in the pipeline. It stays OFF and logs what it

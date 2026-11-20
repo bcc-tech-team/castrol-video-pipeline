@@ -54,10 +54,23 @@ class TestRetryPolicy:
         because it arrived as VENDOR_REJECTED."""
         assert retry_delay_for(1, StageErrorCode.VENDOR_UNAVAILABLE) is not None
 
-    def test_a_provider_outage_still_stops_at_max_attempts(self):
-        # Retried, not retried forever: an outage that outlasts the attempts
-        # ends terminal, and `castrol retry-failed` brings it back later.
-        assert retry_delay_for(3, StageErrorCode.VENDOR_UNAVAILABLE) is None
+    def test_a_provider_outage_gets_the_long_budget(self):
+        """Three attempts at 30s and 60s were over in two minutes, against
+        outage windows that lasted hours; Batch 2 needed four rounds of
+        `retry-failed` by hand. 12 attempts, 1-2-4-8-15-30 minutes."""
+        delays = [retry_delay_for(n, StageErrorCode.VENDOR_UNAVAILABLE) for n in range(1, 13)]
+        assert delays[:6] == [60, 120, 240, 480, 900, 1800]
+        assert delays[6:11] == [1800] * 5
+        assert delays[11] is None
+        assert sum(d for d in delays if d) == 12600  # 3.5 hours of backoff
+
+    def test_a_provider_outage_still_stops_at_its_own_max(self):
+        # Retried, not retried forever: past 12 the failure holds, and
+        # `failure_decision` releases it later up to the lifetime cap.
+        assert retry_delay_for(12, StageErrorCode.VENDOR_UNAVAILABLE) is None
+
+    def test_other_transient_codes_keep_the_short_budget(self):
+        assert retry_delay_for(3, StageErrorCode.VENDOR_TIMEOUT) is None
 
     def test_exhausted_attempts_are_terminal(self):
         from castrol_pipeline.config import get_settings

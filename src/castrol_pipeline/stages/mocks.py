@@ -37,9 +37,11 @@ from ..common.errors import (
     BudgetExhausted,
     StageErrorCode,
     StageFailure,
+    VendorOutOfCredits,
     VendorRejected,
     VendorThrottled,
     VendorTimeout,
+    VendorUnavailable,
 )
 from ..common.events import record_event
 from ..common.s3 import get_storage, job_key
@@ -225,6 +227,11 @@ class MockVideoProvider:
                    else f"{recent} requests in {s.provider_window_s:g}s")
             raise VendorThrottled(f"[mock] video provider 429 on {kind}: {why}")
 
+    def in_windows(self, spec: str, when: float | None = None) -> bool:
+        """Is `when` (default now) inside one of the windows in `spec`?"""
+        at = self.elapsed(when)
+        return any(a <= at < b for a, b in parse_windows(spec))
+
     def stats(self) -> dict[str, Any]:
         s = get_settings()
         with self._lock:
@@ -239,6 +246,25 @@ class MockVideoProvider:
 
 #: The one mock video provider for this process.
 VIDEO_PROVIDER = MockVideoProvider()
+
+
+#: How long a mock render that is going to 500 takes to say so.
+MOCK_500_AFTER_S = 5
+
+
+def render_500(task_id: str) -> bool:
+    """Does this mock render ATTEMPT fail with a provider-side 500?
+
+    Per attempt - the task id carries its submit time - not per job, so a
+    retry can succeed, which is what every one of Batch 1 and 2's did. Every
+    render submitted inside a MOCK_OUTAGE_WINDOWS stretch fails.
+    """
+    s = get_settings()
+    submitted = float(task_id.split("-")[2])
+    if VIDEO_PROVIDER.in_windows(s.mock_outage_windows, submitted):
+        return True
+    digest = hashlib.sha256(task_id.encode()).digest()
+    return int.from_bytes(digest[:4], "big") % 100 < s.mock_render_500_percent
 
 
 def _task_id(stage: PipelineStage, ctx: JobContext) -> str:
@@ -368,6 +394,8 @@ class MockVideo(VideoStage):
                                code=StageErrorCode.ASSET_MISSING)
         _fail_at_submit(ctx, self.name)
         VIDEO_PROVIDER.request("submit")  # where the real HTTP call would be
+        if VIDEO_PROVIDER.in_windows(s.mock_no_credits_windows):
+            raise VendorOutOfCredits("[mock] video provider 402: Credits insufficient")
         seconds = Decimal(str(duration_ms)) / 1000
         billed = Decimal(math.ceil(seconds))
         task_id = _task_id(self.name, ctx)
@@ -382,10 +410,21 @@ class MockVideo(VideoStage):
             billed_seconds=billed,
         )
 
+    def balance_usd(self) -> float:
+        """Zero inside a MOCK_NO_CREDITS_WINDOWS stretch, plenty outside it."""
+        VIDEO_PROVIDER.request("balance")
+        dry = VIDEO_PROVIDER.in_windows(get_settings().mock_no_credits_windows)
+        return 0.0 if dry else 10_000.0
+
     def poll(self, vendor_task_id: str, ctx: JobContext) -> StageResult | None:
         s = get_settings()
         VIDEO_PROVIDER.request("poll")
         kind = _failure(ctx, self.name)
+        if render_500(vendor_task_id) and _age_s(vendor_task_id) >= MOCK_500_AFTER_S:
+            # The real ones fail in seconds ("0s render"), not at the end.
+            raise VendorUnavailable(
+                "[mock] video provider fail: 500 internal error, please try again later"
+            )
         if kind == "VENDOR_TIMEOUT" or _age_s(vendor_task_id) < s.mock_video_seconds:
             return None
         if kind == "VENDOR_REJECTED":

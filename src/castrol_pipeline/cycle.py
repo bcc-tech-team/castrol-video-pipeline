@@ -109,6 +109,9 @@ WORKER_STAGES: tuple[PipelineStage, ...] = (PipelineStage.COMPOSITE,)
 #: minute because `video_poll_interval_s` skips those checked recently.
 POLL_SLICE = 20
 
+#: How often the tick looks for provider-outage failures due for release.
+RELEASE_SWEEP_S = 300.0
+
 #: Seconds of upstream work per tick before the loop goes back to polling.
 UPSTREAM_SLICE_S = 15.0
 
@@ -306,6 +309,11 @@ def intake_window(lookback_days: int, *, today: date | None = None) -> tuple[dat
 def outstanding_work() -> dict[str, Any]:
     """What is still owed: queued runs, in-flight vendor tasks, next retry due.
 
+    Provider-outage failures that will release themselves later count too
+    (`releasing`), and their release time is a due time like any backoff: the
+    cycle waits for them rather than ending and leaving them for the next
+    timer, twelve hours away.
+
     Deliberately not filtered by job status. A job can be marked `failed` on one
     stage while another is still running at a vendor, and that task still has to
     be collected — the submit was already billed (invariant 24), so walking away
@@ -320,13 +328,18 @@ def outstanding_work() -> dict[str, Any]:
          WHERE status IN ('pending', 'claimed', 'running');
         """
     )
+    from .orchestrator import pending_releases
+
     queued = int(row["queued"]) if row else 0
     in_flight = int(row["in_flight"]) if row else 0
+    releases = pending_releases()
+    dues = [d for d in (row["next_due"] if row else None, releases["next_due"]) if d]
     return {
         "queued": queued,
         "in_flight": in_flight,
-        "next_due": row["next_due"] if row else None,
-        "total": queued + in_flight,
+        "releasing": releases["count"],
+        "next_due": min(dues) if dues else None,
+        "total": queued + in_flight + releases["count"],
     }
 
 
@@ -624,7 +637,13 @@ def _work(
     for its delivery.
     """
     from .intake.runner import run_intake
-    from .orchestrator import _checked_mode, poll_once, reap
+    from .orchestrator import (
+        _checked_mode,
+        credits_preflight,
+        poll_once,
+        reap,
+        release_due_failures,
+    )
 
     deadline = clock_start + deadline_minutes * 60
 
@@ -655,8 +674,10 @@ def _work(
     summary["repaired"] = _repair_orphans()
     summary["redelivering"] = len(_reopen_suppressed_deliveries())
     summary["scheduled"] = _schedule_all()
+    summary["credits"] = credits_preflight()
 
     totals: dict[str, int] = summary["stage_runs"]
+    next_sweep = 0.0
     worker = CompositeWorker(stop)
     worker.start()
     try:
@@ -664,6 +685,14 @@ def _work(
             summary["passes"] += 1
             worker.raise_if_failed()
             reap()
+            if time.monotonic() >= next_sweep:
+                # Provider-outage failures that have cooled off go back in the
+                # queue by themselves; capped ones are flagged for a person.
+                swept = release_due_failures()
+                for k, v in swept.items():
+                    if v:
+                        totals[f"auto_{k}"] = totals.get(f"auto_{k}", 0) + v
+                next_sweep = time.monotonic() + RELEASE_SWEEP_S
 
             completed = poll_once(limit=POLL_SLICE)
             if completed:
