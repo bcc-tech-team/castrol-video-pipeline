@@ -814,9 +814,12 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
         {"job_id": job_id},
     )
     with _LAST_POLLED_LOCK:
-        live = {str(r["id"]) for r in rows}
-        for rid in [k for k in _LAST_POLLED if k not in live]:
-            del _LAST_POLLED[rid]
+        if job_id is None:
+            # Forget runs no longer in flight. Only on an unfiltered read: one
+            # job's rows say nothing about whether anyone else's are live.
+            live = {str(r["id"]) for r in rows}
+            for rid in [k for k in _LAST_POLLED if k not in live]:
+                del _LAST_POLLED[rid]
         ordered = poll_order(rows, dict(_LAST_POLLED), time.monotonic())
 
     completed = 0
