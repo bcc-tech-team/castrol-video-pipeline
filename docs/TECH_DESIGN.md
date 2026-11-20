@@ -43,12 +43,33 @@ from `stage_runs`, so the next cycle resumes without remembering anything.
 | repair | `_repair_orphans` | finish the rows a crash left half-created — a submission with no job, a job with no photo (invariant 33) |
 | reopen | `_reopen_suppressed_deliveries` | re-deliver jobs that completed while `DELIVERY_ENABLED` was false (invariant 32) |
 | schedule | `_schedule_all` | enqueue every job that is not `completed` or `cancelled` |
-| work + poll | `drain_stage` / `poll_once` / `reap` | claim `stage_runs`, execute a stage, release; reconcile in-flight vendor tasks; sleep and repeat until nothing is queued and nothing is in flight |
+| work + poll | the tick loop in `_work`, plus `CompositeWorker` | every tick (≤20s idle): reap, poll in-flight vendor tasks, drain checks → publish → deliver, submit renders, then a 15s round-robin slice of image / audio / prep. The card burn runs back to back on its own thread. Repeat until nothing is queued, in flight or burning |
 | stop | the deadline | 8 hours, inside the 12-hour gap; exits 1 with work outstanding, losing nothing |
 
 Concurrency is still per-stage and claiming is still `FOR UPDATE SKIP LOCKED`,
 so more workers remains the answer if composite ever binds — the design below
 is unchanged, it is the process count that was never four.
+
+**The work phase is a tick loop, not a sequence of drains** (2026-11-20). It
+used to drain each stage of `DEFAULT_PLAN` to empty in turn and poll once at
+the end of the pass, so on Batch 2 a render that came back a minute into a
+pass waited behind the whole card-burn backlog, and a finished video waited up
+to an hour for its delivery. Now every tick polls first and drains the
+downstream stages (checks, publish, deliver) next, so a video reaches
+`deliver` within a tick of its card burn finishing. Upstream (image, audio,
+prep) gets a 15-second slice per tick, round-robin and most-downstream first,
+so a 500-job intake feeds renders as it goes. The card burn (~35s per video on
+the worker) runs on ONE thread of its own: the box has two vCPUs and ffmpeg
+already uses both, so a second burn would halve the speed of each. That
+thread only calls `execute_one`; a database error on it is handed back to the
+main thread and ends the cycle as `cycle.db_lost`, and the loop does not
+finish while a burn is in progress, because the burn enqueues `checks` in its
+own `finally` and the queue reads empty until it has.
+
+The arithmetic that follows from this: renders come back faster than one
+thread can card them (60 in flight at ~9 min each is ~6.7 a minute, against
+~1.7 a minute of card burn), so on a 500-video batch the card burn is the
+critical path, at roughly 5 hours. Deliveries trail renders at that rate.
 
 The admin panel (Vercel) reads the same Postgres and writes exactly one table,
 `job_reports` (client review notes). It is not in the critical path and cannot

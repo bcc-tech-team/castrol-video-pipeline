@@ -117,7 +117,7 @@ def cycle(
     deadline_minutes: Annotated[
         int, typer.Option("--deadline-minutes", help="Stop working after this long")
     ] = 480,
-    interval: Annotated[int, typer.Option(help="Seconds between passes")] = 60,
+    interval: Annotated[int, typer.Option(help="Seconds between ticks when idle")] = 20,
     no_fetch: Annotated[
         bool, typer.Option("--no-fetch", help="Skip intake; only finish existing work")
     ] = False,

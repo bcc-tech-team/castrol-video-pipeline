@@ -756,7 +756,7 @@ rules, not application code.
 |---|---|
 | Every `castrol <cmd>` | [`src/castrol_pipeline/cli.py`](src/castrol_pipeline/cli.py) |
 | Claiming, retries, poller, **all writes to `jobs`** | [`orchestrator.py`](src/castrol_pipeline/orchestrator.py) |
-| The unattended run: lock, window, orphan repair, wait loop | [`cycle.py`](src/castrol_pipeline/cycle.py) |
+| The unattended run: lock, window, orphan repair, tick loop, composite thread | [`cycle.py`](src/castrol_pipeline/cycle.py) |
 | Any identifier → job | [`jobref.py`](src/castrol_pipeline/jobref.py) |
 | One job to a finish (`castrol run`), per-job lock | [`jobrun.py`](src/castrol_pipeline/jobrun.py) |
 | The `castrol` command on the EC2 box | [`deploy/castrol`](deploy/castrol) |
@@ -1554,6 +1554,17 @@ fix is its inputs, not a patch stage. Do not reintroduce it.
 mid-batch was not "missed". The docker unit removes a leftover `castrol-cycle`
 container first, which a hard stop leaves behind and which would otherwise fail
 that very start on a name conflict.
+
+**The work phase is a tick loop, and the card burn has its own thread**
+(2026-11-20). Each tick polls, then drains checks → publish → deliver, submits
+renders, and gives image / audio / prep a 15s round-robin slice; composite runs
+back to back on `cycle.CompositeWorker`. It replaced drain-every-stage-to-empty
+passes, under which Batch 2's finished videos waited up to an hour behind the
+card-burn backlog for delivery. One composite thread, not two: ffmpeg already
+uses both vCPUs. The loop must not end while that thread is mid-burn — the
+burn enqueues `checks` in its own `finally`, so the queue reads empty until it
+has — and an error on the thread is re-raised on the main one, so a lost
+database is still `cycle.db_lost`. See `docs/TECH_DESIGN.md` §2.
 
 **The run is automated, twice a day.** `castrol cycle` is the whole flow —
 pull, schedule, work, wait, stop — driven by a systemd timer at 00:00 and 12:00
