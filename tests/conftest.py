@@ -14,7 +14,9 @@ def _fresh_provider_state():
     pacing.reset()
     health.reset()
     orchestrator._LAST_POLLED.clear()
+    orchestrator._VERDICT_TAKEN.clear()
     yield
     pacing.reset()
     health.reset()
     orchestrator._LAST_POLLED.clear()
+    orchestrator._VERDICT_TAKEN.clear()

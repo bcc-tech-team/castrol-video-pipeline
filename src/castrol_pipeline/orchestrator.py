@@ -792,8 +792,13 @@ def credits_preflight() -> dict[str, Any] | None:
 # ----------------------------------------------------- self-releasing holds --
 
 
+#: How long past its due time a self-release still counts as outstanding:
+#: three sweeps' worth. See `pending_releases`.
+RELEASE_GRACE_S = 900
+
 _RELEASABLE_SQL = """
-SELECT job_id, stage, id, finished_at, lifetime_attempts
+SELECT latest.job_id, latest.stage, latest.id, latest.finished_at,
+       latest.lifetime_attempts
   FROM (SELECT DISTINCT ON (job_id, stage) job_id, stage, id, status, error_code,
                finished_at, lifetime_attempts
           FROM (SELECT *, sum(attempts) OVER (PARTITION BY job_id, stage, input_hash)
@@ -801,7 +806,11 @@ SELECT job_id, stage, id, finished_at, lifetime_attempts
                   FROM stage_runs
                  WHERE status <> 'skipped') runs
          ORDER BY job_id, stage, created_at DESC) latest
- WHERE status = 'failed' AND error_code = %(code)s;
+  JOIN jobs j ON j.id = latest.job_id
+ WHERE latest.status = 'failed' AND latest.error_code = %(code)s
+   -- A cancelled job is a person's decision, and releasing it would pay for a
+   -- render nobody wants and flip it back to `running` in advance_job.
+   AND j.status NOT IN ('cancelled', 'completed');
 """
 
 
@@ -817,13 +826,21 @@ def pending_releases(
 
     The cycle counts these as outstanding work, so it waits for them instead
     of ending and leaving them for the next timer twelve hours away.
+
+    One that fell due more than `RELEASE_GRACE_S` ago is NOT counted: the
+    sweep runs every 5 minutes, so a failure still listed long after its due
+    time is one `schedule_ready` declined - its stage is not ready, because a
+    `redo` upstream failed for good, say. Counting it would hold every cycle
+    open to its 8-hour deadline over a release that cannot happen.
     """
     s = get_settings()
+    now = now or datetime.now(UTC)
     rows = unavailable_failures() if rows is None else rows
     due = [r["finished_at"] + timedelta(seconds=s.unavailable_release_after_s)
            for r in rows
            if int(r["lifetime_attempts"] or 0) < s.unavailable_lifetime_attempts
            and r["finished_at"] is not None]
+    due = [d for d in due if d >= now - timedelta(seconds=RELEASE_GRACE_S)]
     return {"count": len(due), "next_due": min(due) if due else None}
 
 
@@ -1077,6 +1094,9 @@ _TRANSIENT_POLL_ERRORS: tuple[type[BaseException], ...] = (
 #: In memory on purpose: it only spaces out polls, and a restart that forgets
 #: it costs one extra poll per task.
 _LAST_POLLED: dict[str, float] = {}
+#: Runs whose provider has already been given a verdict on them by the outage
+#: breaker (`_record_outcome`), so a later still-rendering poll adds nothing.
+_VERDICT_TAKEN: set[str] = set()
 _LAST_POLLED_LOCK = threading.Lock()
 
 
@@ -1137,6 +1157,7 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
             live = {str(r["id"]) for r in rows}
             for rid in [k for k in _LAST_POLLED if k not in live]:
                 del _LAST_POLLED[rid]
+            _VERDICT_TAKEN.intersection_update(live)
         ordered = poll_order(rows, dict(_LAST_POLLED), time.monotonic())
 
     completed = 0
@@ -1156,7 +1177,10 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
             continue
         polled += 1
         with _LAST_POLLED_LOCK:
-            first_look = str(run["id"]) not in _LAST_POLLED
+            # The first ANSWER about this task, not the first attempt to ask:
+            # a poll that errors gives no verdict, and burning the look on it
+            # left a probe with no verdict ever, and submits blocked.
+            first_look = str(run["id"]) not in _VERDICT_TAKEN
             _LAST_POLLED[str(run["id"])] = time.monotonic()
 
         job_id = str(run["job_id"])
@@ -1168,6 +1192,7 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                     if first_look:
                         # Rendering, not refused: the provider took the work.
                         _record_outcome(stage, failed=False)
+                        _VERDICT_TAKEN.add(str(run["id"]))
                     # Still in flight — unless it has been in flight too long.
                     # The poller is stateless per pass, so without this a task
                     # the vendor silently dropped stays `running` forever: the
@@ -1177,8 +1202,17 @@ def poll_once(*, limit: int = 100, job_id: str | None = None) -> int:
                 _persist_result(ctx, run, result)
                 if first_look:
                     _record_outcome(stage, failed=False)
+                    _VERDICT_TAKEN.add(str(run["id"]))
                 completed += 1
                 log.info("stage.polled_complete", output_key=result.output_key)
+            except VendorOutOfCredits as exc:
+                # A status check should never say this, but if it does it is
+                # still not an answer about the task - which may be rendering.
+                # Failing it here would put the run back in the queue and
+                # resubmit beside it (invariant 13). Leave it `running`.
+                exhausted.add(stage)
+                log.warning("stage.poll_out_of_credits", error=str(exc)[:300])
+                _fail_if_overdue(run, stage)
             except VendorThrottled as exc:
                 # Not an answer about the task, which is untouched. Leave it
                 # `running` and stop asking this provider for the rest of the

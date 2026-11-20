@@ -428,3 +428,83 @@ class TestBreakerIsFedAtFirstPoll:
 
         verdicts = self._poll(monkeypatch, VendorUnavailable("500"))
         assert verdicts and all(verdicts)
+
+
+class TestReviewFixes:
+    """Four defects an independent review found before merge."""
+
+    def test_a_probe_with_no_verdict_does_not_block_forever(self, events) -> None:
+        h, clock = _breaker(pause_s=300, probes=2)
+        for _ in range(20):
+            h.record_verdict(failed=True)
+        clock.t += 301
+        assert h.submit_block_reason() is None
+        h.note_submit()
+        h.note_submit()
+        clock.t += 600
+        assert h.submit_block_reason(), "should still wait on the probes"
+        clock.t += 301  # 15 minutes with no verdict on either probe
+        assert h.submit_block_reason() is None, "blocked for good on lost probes"
+
+    def test_a_first_poll_that_errors_does_not_use_up_the_verdict(self, monkeypatch) -> None:
+        import httpx
+
+        verdicts: list[bool] = []
+        answers = [httpx.ReadError("reset"), None]
+        monkeypatch.setattr(orchestrator, "_record_outcome",
+                            lambda stage, *, failed: verdicts.append(failed))
+
+        class Video:
+            is_async = True
+
+            def poll(self, task_id, ctx):
+                a = answers.pop(0)
+                if isinstance(a, Exception):
+                    raise a
+                return a
+
+        monkeypatch.setattr(orchestrator, "get_stage_registry", lambda: {S.VIDEO: Video()})
+        row = {"id": "r1", "job_id": "00000000-0000-0000-0000-000000000001",
+               "stage": "video", "vendor_task_id": "t1", "attempts": 1,
+               "started_at": datetime.now(UTC)}
+        monkeypatch.setattr(orchestrator.db, "fetch_all", lambda *a, **k: [row])
+        monkeypatch.setattr(orchestrator, "load_context", lambda j: object())
+        monkeypatch.setattr(orchestrator, "record_event", lambda *a, **k: None)
+        monkeypatch.setattr(orchestrator, "schedule_ready", lambda *a, **k: [])
+        monkeypatch.setattr(orchestrator, "advance_job", lambda *a, **k: None)
+        orchestrator.poll_once()
+        orchestrator._LAST_POLLED.clear()  # due again; the verdict memory stays
+        orchestrator.poll_once()
+        assert verdicts == [False]
+
+    def test_a_402_on_a_poll_leaves_the_task_running(self, monkeypatch) -> None:
+        failed: list[str] = []
+
+        class Video:
+            is_async = True
+
+            def poll(self, task_id, ctx):
+                raise VendorOutOfCredits("402 on recordInfo")
+
+        monkeypatch.setattr(orchestrator, "get_stage_registry", lambda: {S.VIDEO: Video()})
+        row = {"id": "r1", "job_id": "00000000-0000-0000-0000-000000000001",
+               "stage": "video", "vendor_task_id": "t1", "attempts": 1,
+               "started_at": datetime.now(UTC)}
+        monkeypatch.setattr(orchestrator.db, "fetch_all", lambda *a, **k: [row])
+        monkeypatch.setattr(orchestrator.db, "mark_failed", lambda rid, **k: failed.append(rid))
+        monkeypatch.setattr(orchestrator, "load_context", lambda j: object())
+        monkeypatch.setattr(orchestrator, "schedule_ready", lambda *a, **k: [])
+        monkeypatch.setattr(orchestrator, "advance_job", lambda *a, **k: None)
+        orchestrator.poll_once()
+        assert failed == [], "a 402 on a poll queued a resubmit beside a live render"
+
+    def test_a_release_the_sweep_could_not_make_does_not_hold_the_cycle(self) -> None:
+        now = datetime.now(UTC)
+        stuck = {"finished_at": now - timedelta(hours=3), "lifetime_attempts": 12}
+        fresh = {"finished_at": now - timedelta(minutes=10), "lifetime_attempts": 12}
+        out = orchestrator.pending_releases([stuck, fresh], now=now)
+        assert out["count"] == 1
+
+    def test_a_cancelled_job_is_never_released(self) -> None:
+        sql = " ".join(orchestrator._RELEASABLE_SQL.split())
+        assert "j.status NOT IN ('cancelled', 'completed')" in sql

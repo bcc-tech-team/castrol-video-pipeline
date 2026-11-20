@@ -1608,6 +1608,16 @@ sliding window and not a token bucket, on purpose: a bucket lets 2N through
 across a window edge. Per process, so a hand-run `castrol run` beside the cycle
 has its own — which is why the default sits under the provider's figure.
 
+**What this means for the hand-run commands.** `castrol run`, `work`, `drain`
+and `poll` go through the same gates as the cycle. A blocked stage (credits,
+outage pause, the in-flight cap, no request slot) reads as "nothing to do right
+now", so `drain` / `work --stage video` report 0 and stop rather than wait, and
+`castrol run <job>` waits while the cycle holds all 60 render slots. A provider
+500 under `castrol run` gets the long 12-attempt budget too. And a 429 or 402
+on submit still spends its `vendor_usage` reservation — `budget.vendor_call`
+reserves before the request — which is bounded by the limiter and deliberate,
+like every other reservation.
+
 **A provider outage pauses submits, and so does an empty balance**
 (2026-11-20, [`common/health.py`](src/castrol_pipeline/common/health.py)).
 When at least 90% of the last 20–30 renders (no older than 20 min) came back as

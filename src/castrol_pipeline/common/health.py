@@ -56,6 +56,7 @@ class OutagePolicy:
     pause_s: float = 300      # first pause
     max_pause_s: float = 1800  # pauses double, up to this
     probes: int = 2           # submits let through to test the water
+    probe_timeout_s: float = 900  # no verdict on the probes by then: send more
 
     @classmethod
     def from_settings(cls) -> OutagePolicy:
@@ -90,6 +91,7 @@ class ProviderHealth:
         self._paused_until = 0.0
         self._pause_s = self.policy.pause_s
         self._probes_sent = 0
+        self._probing_since = 0.0
         #: When the current outage began, across every pause/probe round of
         #: it. None when the provider is healthy. What the >1h alert reads.
         self.outage_since: float | None = None
@@ -207,11 +209,19 @@ class ProviderHealth:
                     return f"{self.provider} provider outage pause"
                 self.state = PROBING
                 self._probes_sent = 0
+                self._probing_since = now
                 log.info("provider.outage_probing", provider=self.provider)
                 record_event("provider.outage_probing", level="warning",
                              provider=self.provider, probes=self.policy.probes)
             if self.state == PROBING and self._probes_sent >= self.policy.probes:
-                return f"{self.provider} provider: waiting on probe renders"
+                if now - self._probing_since < self.policy.probe_timeout_s:
+                    return f"{self.provider} provider: waiting on probe renders"
+                # No verdict on either probe in all that time - their polls
+                # kept erroring, most likely. Never block on that forever:
+                # send the next pair.
+                self._probes_sent = 0
+                self._probing_since = now
+                log.warning("provider.probe_timeout", provider=self.provider)
             return None
 
     def note_submit(self) -> None:
