@@ -269,6 +269,15 @@ midnight.
   raised by
   `0012` to match so the money limit is what trips.
 
+- **Automatic upgrades can still restart docker under a cycle until the three
+  files from `deploy/` are installed.** That is what killed batch
+  `4f5d2b39-aba5-4967-ad7b-c413585410f9` on 2026-11-18. The files are
+  `51castrol-unattended-upgrades`, `needrestart-castrol.conf` and
+  `apt-daily-upgrade-castrol.conf`, plus the updated `castrol` command. The
+  install and verify commands are in
+  [`deploy/README.md` § Automatic upgrades](../deploy/README.md#automatic-upgrades).
+  Once installed, docker, containerd and runc are patched by hand between
+  cycles. Remove this item when that is done.
 - **Root was used for provisioning.** Switch to `castrol-server` for
   administration; root cannot be scoped, revoked per-action, or attributed to a
   person.
@@ -297,6 +306,7 @@ journalctl -u castrol-cycle --since today -o cat | jq -c 'select(.level=="error"
 ```
 
 Exit codes: `0` ran clean or skipped on the advisory lock; `1` the export pull
-failed **or** the deadline hit with work outstanding. Neither loses work —
-readiness is recomputed from `stage_runs`. Alert on `systemctl --failed`
-containing `castrol-cycle`.
+failed **or** the deadline hit with work outstanding; `75` the database
+connection was lost mid-run; `143` a SIGTERM stopped it between steps. None of
+them loses work — readiness is recomputed from `stage_runs`. Alert on
+`systemctl --failed` containing `castrol-cycle`.
