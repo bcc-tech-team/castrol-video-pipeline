@@ -205,6 +205,15 @@ class Settings(BaseSettings):
     outage_max_pause_s: float = Field(default=1800, ge=0)
     outage_probes: int = Field(default=2, ge=1)
 
+    # ---------------------------------------------------------- alerts --
+    # Where an alert goes beyond its `alert.<kind>` event (common/alerts.py).
+    # "events" is the only channel so far: the owner has not chosen one.
+    alert_channel: str = "events"
+    # The same alert (same dedupe key) is said at most once in this window.
+    alert_repeat_s: int = Field(default=21600, ge=0)
+    # An outage pause older than this is an alert.
+    alert_outage_minutes: float = Field(default=60, gt=0)
+
     # While paused for credits, how often the balance endpoint is asked.
     credits_recheck_s: float = Field(default=300, ge=1)
     # Render length assumed for a job whose audio is not made yet, when

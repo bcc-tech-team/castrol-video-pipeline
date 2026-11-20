@@ -1076,7 +1076,27 @@ match that shape row by row. `format.ts` ceils as well and is now a no-op on
 anything this view returns — kept as the guard for the day someone edits the
 expression back.
 
-No alerting this release, by decision.
+**Alerts** (2026-11-20, [`common/alerts.py`](../src/castrol_pipeline/common/alerts.py)).
+"No alerting this release" was the decision while a person watched every
+batch; a 500-video batch that runs from intake to the last delivery with
+nobody watching needs the few things it cannot fix to be said. There are three:
+
+| `alert.<kind>` | raised by | means |
+|---|---|---|
+| `credits_low` | `credits_preflight` at cycle start; the first 402 of a pause | the video balance does not cover the renders queued; only a top-up fixes it |
+| `provider_outage` | `check_alerts`, every tick | the outage pause has lasted over `ALERT_OUTAGE_MINUTES` (60) |
+| `job_attempt_cap` | `release_due_failures` | a job spent its 24 lifetime attempts on provider 500s and holds for a person |
+
+The record is the event - level `error` in `job_events`, with a one-sentence
+`summary` - written whatever the channel. Each is said once per dedupe key per
+`ALERT_REPEAT_S` (6 h), checked against `job_events` so the noon cycle does not
+repeat midnight's. `castrol alerts` lists them and exits 1 if there are any;
+`castrol report` and the cycle's own summary carry them too.
+
+**No channel is wired.** Email, Slack and WhatsApp are open; `ALERT_CHANNEL`
+is `events` (event and log line only) until the owner picks one. A channel is
+a `Notifier` with one `send(alert)` method, registered in `NOTIFIERS`; it is a
+second copy, best effort, and a failure in it never stops the cycle.
 
 ---
 

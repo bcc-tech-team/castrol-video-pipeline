@@ -47,11 +47,23 @@ and everything below is either how to install it or how to read what it did.
    them, and a previous cycle may have stopped at its deadline. This step is why
    a cycle needs no memory of what the last one did.
 
-6. **Works, then waits, then works again** until nothing is queued and nothing
-   is in flight at a vendor. This is the part `drain` gets wrong for unattended
-   use: `drain` stops as soon as a sweep moves nothing, which for an avatar
-   render means "still rendering" — it would submit every paid job and exit
-   before collecting a single result.
+6. **Works in short ticks** until nothing is queued, in flight at a vendor,
+   being carded, or due to release itself. Each tick polls what is in flight,
+   delivers what is finished, submits renders up to the in-flight cap (60),
+   and gives upstream a 15s slice; the card burn runs on its own thread, so a
+   video reaches `deliver` within a tick of its card. This is the part `drain`
+   gets wrong for unattended use: `drain` stops as soon as a sweep moves
+   nothing, which for an avatar render means "still rendering" — it would
+   submit every paid job and exit before collecting a single result.
+
+   **It heals the provider's bad days by itself** (2026-11-20). Every request
+   to a provider is paced (15 per 10s on video, under its 20); a 429 puts the
+   run back without spending an attempt. A provider 500 retries 12 times over
+   3.5 hours and then releases itself again 30 minutes later, up to 24
+   attempts in all. When nearly every recent render 500s, submits pause and
+   probe. A 402 pauses every submit until the balance covers the work, then
+   resumes. None of it needs `retry-failed`. What does need you is an alert —
+   `castrol alerts` — see below.
 
 7. **Stops at a deadline** (default 8 hours, inside the 12-hour gap) and
    exits 1 if work is still outstanding. Nothing is lost when this happens —
@@ -65,6 +77,24 @@ would have POSTed and records the delivery row without posting. Everything up to
 and including publish runs for real, so turning delivery on later requires no
 re-render: flip the variable, and step 4 of the next cycle reopens the whole
 suppressed backlog at once.
+
+### What needs you: `castrol alerts`
+
+```bash
+castrol alerts --hours 24
+```
+
+Three kinds, each an `alert.<kind>` event at level `error`, each said once per
+6 hours, and the command exits 1 when there are any:
+
+| alert | what to do |
+|---|---|
+| `credits_low` | Top up the video provider. Submits are paused (or will be part way through the batch) and resume by themselves within 5 minutes of the balance covering the next set of renders. |
+| `provider_outage` | Usually nothing. Submits are paused and probed; renders already accepted are still collected. If it outlasts the cycle, the next one carries on. |
+| `job_attempt_cap` | That job failed 24 times on provider errors. Look at it (`castrol show <id>`, `castrol events <id>`) and, once the provider is healthy, `castrol run <id> --retry`. |
+
+No channel sends these anywhere yet — check `castrol alerts` (or `castrol
+report`, which carries them under `alerts_24h`) after a batch.
 
 ---
 

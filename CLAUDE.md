@@ -236,6 +236,23 @@ uv run castrol schedule
 uv run castrol intake --from 2026-09-01 --to 2026-09-01
 ```
 
+### Alerts — what needs a person
+
+The three things the pipeline cannot fix by itself: the video balance too low
+for the queue (`credits_low`), a provider outage paused for over an hour
+(`provider_outage`), and a job past its 24-attempt lifetime cap
+(`job_attempt_cap`). Each is an `alert.<kind>` event at level `error`, said
+once per 6h per key. Exit 1 if there are any. → [`common/alerts.py`](src/castrol_pipeline/common/alerts.py)
+
+```bash
+uv run castrol alerts --hours 24
+```
+
+**No channel is wired yet — that is the owner's choice (email / Slack /
+WhatsApp), not an oversight.** `ALERT_CHANNEL=events` records and logs. A
+channel is one `Notifier` class with `send(alert)` plus an entry in
+`alerts.NOTIFIERS`; it must never raise into the cycle.
+
 ### Inspecting a run
 
 → [`cli.py`](src/castrol_pipeline/cli.py) and
@@ -778,6 +795,7 @@ rules, not application code.
 | Anything that talks to a provider | [`stages/vendors.py`](src/castrol_pipeline/stages/vendors.py) |
 | Request limiter per provider, in-flight caps | [`common/pacing.py`](src/castrol_pipeline/common/pacing.py) |
 | Outage pause, credits pause, per provider | [`common/health.py`](src/castrol_pipeline/common/health.py) |
+| Alerts and the notifier seam | [`common/alerts.py`](src/castrol_pipeline/common/alerts.py) |
 | Which failures release themselves, and when | [`orchestrator.py:failure_decision`](src/castrol_pipeline/orchestrator.py) |
 | Anything local and free — **the card**, ffmpeg, ffprobe | [`stages/media.py`](src/castrol_pipeline/stages/media.py) |
 | No-spend doubles (`USE_STUB_STAGES=true`) | [`stages/stubs.py`](src/castrol_pipeline/stages/stubs.py) |

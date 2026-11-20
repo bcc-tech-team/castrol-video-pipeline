@@ -163,16 +163,18 @@ class ProviderHealth:
 
     # ------------------------------------------------------------ credits --
 
-    def pause_for_credits(self, detail: str) -> None:
+    def pause_for_credits(self, detail: str) -> bool:
+        """Pause submits for credits. True if this started a new pause."""
         with self._lock:
             if self.credits_since is not None:
-                return
+                return False
             now = self._clock()
             self.credits_since = now
             self.next_balance_check = now + get_settings().credits_recheck_s
         log.error("provider.credits_exhausted", provider=self.provider)
         record_event("provider.credits_exhausted", level="error",
                      provider=self.provider, detail=detail[:300])
+        return True
 
     def balance_check_due(self) -> bool:
         with self._lock:

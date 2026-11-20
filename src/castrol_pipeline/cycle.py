@@ -287,6 +287,19 @@ def _drain_for(
     return False
 
 
+def _alerts_since(started_at: datetime) -> list[str]:
+    """One line per alert this cycle raised, for the summary it prints."""
+    rows = db.fetch_all(
+        """
+        SELECT event, fields ->> 'summary' AS summary FROM job_events
+         WHERE event LIKE 'alert.%%' AND created_at >= %(since)s
+         ORDER BY created_at;
+        """,
+        {"since": started_at},
+    )
+    return [f"{r.get('event')}: {r.get('summary')}" for r in rows if r.get("event")]
+
+
 def intake_window(lookback_days: int, *, today: date | None = None) -> tuple[date, date]:
     """The window to pull, on the client's calendar.
 
@@ -639,6 +652,7 @@ def _work(
     from .intake.runner import run_intake
     from .orchestrator import (
         _checked_mode,
+        check_alerts,
         credits_preflight,
         poll_once,
         reap,
@@ -685,6 +699,7 @@ def _work(
             summary["passes"] += 1
             worker.raise_if_failed()
             reap()
+            check_alerts()
             if time.monotonic() >= next_sweep:
                 # Provider-outage failures that have cooled off go back in the
                 # queue by themselves; capped ones are flagged for a person.
@@ -776,6 +791,7 @@ def _work(
         r["status"]: r["n"]
         for r in db.fetch_all("SELECT status, count(*) AS n FROM jobs GROUP BY status;")
     }
+    summary["alerts"] = _alerts_since(summary["started_at"])
     log.info("cycle.done", **{k: summary[k] for k in ("passes", "elapsed_s", "jobs")})
     record_event(
         "cycle.done",

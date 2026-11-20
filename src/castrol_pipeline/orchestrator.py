@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from psycopg.types.json import Jsonb
 
-from .common import budget, db, health, pacing
+from .common import alerts, budget, db, health, pacing
 from .common.errors import (
     TERMINAL_STAGE_ERRORS,
     PipelineError,
@@ -786,7 +786,41 @@ def credits_preflight() -> dict[str, Any] | None:
     if out["short"]:
         log.warning("cycle.credits_short", **out)
         record_event("cycle.credits_short", level="warning", **out)
+        per = spend["per_render_usd"]
+        # Rounded first: 108.0 / 1.08 is 99.999... in floating point.
+        covers = int(round(balance / per, 6)) if per else 0
+        alerts.raise_alert(
+            alerts.CREDITS_LOW,
+            f"The video balance (${balance:,.2f}) covers about {covers} of the "
+            f"{spend['renders']} renders queued (${spend['usd']:,.2f}). Top up "
+            f"about ${spend['usd'] - balance:,.2f}, or the batch pauses part way.",
+            dedupe_key="credits_low:preflight",
+            **out,
+        )
     return out
+
+
+def check_alerts() -> list[str]:
+    """Raise what the tick can see: an outage pause that has gone on too long.
+
+    Cheap - it reads in-memory state - so the cycle calls it every tick.
+    Returns the kinds raised.
+    """
+    raised: list[str] = []
+    limit = get_settings().alert_outage_minutes
+    for provider, h in health.all_health().items():
+        minutes = h.outage_minutes()
+        if minutes > limit and alerts.raise_alert(
+            alerts.PROVIDER_OUTAGE,
+            f"The {provider} provider has been failing for {minutes:.0f} minutes. "
+            "New work is paused and probed every few minutes; renders already "
+            "accepted are still being collected. Nothing to do unless it lasts.",
+            dedupe_key=f"provider_outage:{provider}",
+            provider=provider,
+            minutes=round(minutes, 1),
+        ):
+            raised.append(alerts.PROVIDER_OUTAGE)
+    return raised
 
 
 # ----------------------------------------------------- self-releasing holds --
@@ -876,6 +910,18 @@ def release_due_failures(*, now: datetime | None = None) -> dict[str, int]:
                     level="error",
                     lifetime_attempts=int(row["lifetime_attempts"]),
                     lifetime_cap=s.unavailable_lifetime_attempts,
+                )
+                alerts.raise_alert(
+                    alerts.JOB_ATTEMPT_CAP,
+                    f"Job {job_id} failed {row['lifetime_attempts']} times at "
+                    f"{row['stage']} on provider errors and will not be retried "
+                    f"again by itself. `castrol run {job_id} --retry` when the "
+                    "provider is healthy.",
+                    dedupe_key=f"job_attempt_cap:{row['id']}",
+                    job_id=job_id,
+                    stage=str(row["stage"]),
+                    stage_run_id=str(row["id"]),
+                    lifetime_attempts=int(row["lifetime_attempts"]),
                 )
             continue
         finished = row["finished_at"]
@@ -1001,8 +1047,14 @@ def execute_one(
             # the balance covers the work again (`submit_blocked`).
             db.release_claim(run_id, delay_seconds=0, reason=str(exc)[:500])
             provider = pacing.STAGE_PROVIDER.get(stage)
-            if provider is not None:
-                health.health(provider).pause_for_credits(str(exc))
+            if provider is not None and health.health(provider).pause_for_credits(str(exc)):
+                alerts.raise_alert(
+                    alerts.CREDITS_LOW,
+                    f"The {provider} provider is out of credits. New {stage} work "
+                    "is paused and resumes by itself once the account is topped up.",
+                    dedupe_key=f"credits_low:exhausted:{provider}",
+                    provider=provider,
+                )
             return False
 
         except Exception as exc:  # noqa: BLE001 - the orchestrator is the boundary
