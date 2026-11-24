@@ -1272,6 +1272,17 @@ chest logo" is how a hand ended up on the logo), never ask for individuated
 fingers (r2's "counting gesture" is where the claw came from), and never name a
 repeatable movement — of the hands or the head — unless you want it on a loop.
 
+**r6 (2026-11-24) keeps him ALONE in the frame.** Two delivered renders grew a
+second mechanic in the same uniform, walking in behind the car a few seconds
+in, leaning over it for most of the take and walking out — nowhere in the
+still. "In his garage" describes a workplace, and this model fills a described
+place with what usually happens there. The prompt now says he is `alone in the
+frame` and puts the background inside the keep-unchanged clause, `still for
+the whole take`. Positively phrased like everything else in it: naming "other
+people" is how you summon them. Pinned by `TestHeIsAloneInTheFrame`. It is one
+render's worth of direction, not a guarantee — a model that adds people
+unprompted can still do it; check the background on the next batch.
+
 **30. The avatar prompt is hashed as TEXT, not as a version string.**
 *`stages/real.py:VideoStage._params`*
 A version string is a thing you can forget to bump — edit the wording, leave
@@ -1558,6 +1569,20 @@ resolution. It was the artwork.
 
 Each combination now has three rows, one active and two retired, and older jobs
 still point at the artwork they were built from (invariant 31 doing its job).
+
+**The arms were revised on 2026-11-24, and every combination gained a fourth
+row** — `approved_by` starts `arms revision 2026-11-24`. The 2026-09-11 plates
+had smooth, hairless, airbrushed forearms with manicured nails, and every video
+inherited them: source photos are chest-up selfies that almost never show a
+forearm, so the image edit has no arm of the mechanic's to copy and keeps the
+plate's, recoloured. The new artwork changes ONLY the bare skin of the forearms
+and hands — natural arm hair, veins, knuckle creases, short plain nails — with
+pose, hand position, face, uniform and background untouched (pixel difference
+outside the arms is re-encode noise). Made by
+[`spikes/plate_arms.py`](spikes/plate_arms.py), one image-only edit per plate.
+`u1_tshirt` + `bg1` was proven through to video first: the hair survives the
+image edit, and the 720p avatar render, and a teenager's photo still comes out
+with a boy's arms rather than the plate's. Grime was deliberately not added.
 
 **To check the repo and the database agree, hash the NORMALISED file, not the
 raw one.** `register_plate` stores `sha256(normalise_for_image_provider(file))`, and

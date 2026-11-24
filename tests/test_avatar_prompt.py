@@ -219,3 +219,36 @@ class TestHeadMotionIsReduced:
         # the life left in the frame, so the prompt has to ask for them.
         low = AVATAR_PROMPT.lower()
         assert "engaged face" in low
+
+
+class TestHeIsAloneInTheFrame:
+    """r6, 2026-11-24, from two delivered videos.
+
+    9391709420 and 8571038306 each grew a second mechanic in the same uniform:
+    he walks in behind the car about three seconds in, leans over it for most
+    of the take and walks out. Nobody is behind the car in the still. "in his
+    garage" describes a workplace, and this model fills a described place with
+    what usually happens there.
+
+    The fix says it the way every other constraint here is said - as what TO
+    do. Naming "other people" or "anyone else" is the surest way to get them.
+    """
+
+    def test_he_is_alone(self):
+        assert "alone in the frame" in AVATAR_PROMPT.lower()
+
+    def test_the_background_is_held(self):
+        # Part of what stays unchanged, and held still for the WHOLE take:
+        # the extra person never arrived in the first second, always later.
+        low = AVATAR_PROMPT.lower()
+        keep_clause = low[low.index("keep the existing"):]
+        assert "background" in keep_clause
+        assert "still for the whole take" in keep_clause
+
+    def test_people_are_not_named(self):
+        low = AVATAR_PROMPT.lower()
+        for summons in ("other people", "anyone else", "no one", "nobody",
+                        "coworker", "colleague", "second person", "customers"):
+            assert summons not in low, (
+                f"{summons!r} names the thing r6 exists to keep out of frame"
+            )
