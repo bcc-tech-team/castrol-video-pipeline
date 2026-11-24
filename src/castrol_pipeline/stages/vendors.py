@@ -403,16 +403,26 @@ def image_poll(task_id: str) -> str | None:
 #: hands low and the head still, the eyes and mouth are all the life left, so
 #: the prompt has to ask for them by name.
 #:
+#: r6 (2026-11-24) KEEPS HIM ALONE. Delivered renders (9391709420, 8571038306)
+#: grew a second mechanic in the same uniform who walks in behind the car,
+#: leans over it for most of the take and walks out - nowhere in the still.
+#: "in his garage" describes a busy workplace, and this model fills a described
+#: place with what usually happens there. The fix names the frame positively
+#: rather than forbidding people: he is ALONE in it, and the background is part
+#: of what stays unchanged, held still for the whole take. Written as what TO
+#: do, because naming "other people" is how you get them (test_phrased_positively).
+#:
 #: This text is part of the video input_hash, so editing it regenerates. See
 #: VideoStage._params.
 AVATAR_PROMPT = (
-    "An Indian auto mechanic in his Castrol work uniform, speaking directly to "
-    "camera in his garage. Calm, natural and slow, with clear articulation and "
-    "a warm, engaged face, and a steady head that stays level and facing "
+    "An Indian auto mechanic in his Castrol work uniform, alone in the frame, "
+    "speaking directly to camera in his garage. Calm, natural and slow, with "
+    "clear articulation and a warm, engaged face, and a steady head that stays level and facing "
     "camera with only slight natural movement. His hands stay low and mostly "
     "still, one on each side of his body, apart from each other and clear of "
     "one another at all times, with only small slow movements that settle back "
-    "to rest. Keep the existing framing, uniform and branding unchanged."
+    "to rest. Keep the existing framing, uniform, branding and background "
+    "unchanged, with the garage behind him still for the whole take."
 )
 
 

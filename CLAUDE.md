@@ -1272,6 +1272,17 @@ chest logo" is how a hand ended up on the logo), never ask for individuated
 fingers (r2's "counting gesture" is where the claw came from), and never name a
 repeatable movement — of the hands or the head — unless you want it on a loop.
 
+**r6 (2026-11-24) keeps him ALONE in the frame.** Two delivered renders grew a
+second mechanic in the same uniform, walking in behind the car a few seconds
+in, leaning over it for most of the take and walking out — nowhere in the
+still. "In his garage" describes a workplace, and this model fills a described
+place with what usually happens there. The prompt now says he is `alone in the
+frame` and puts the background inside the keep-unchanged clause, `still for
+the whole take`. Positively phrased like everything else in it: naming "other
+people" is how you summon them. Pinned by `TestHeIsAloneInTheFrame`. It is one
+render's worth of direction, not a guarantee — a model that adds people
+unprompted can still do it; check the background on the next batch.
+
 **30. The avatar prompt is hashed as TEXT, not as a version string.**
 *`stages/real.py:VideoStage._params`*
 A version string is a thing you can forget to bump — edit the wording, leave
