@@ -247,6 +247,15 @@ def mark_running(
     Cost lands HERE, not on completion. The submit is what incurred it, and a
     task that never completes still cost money — recording it only on success
     would make exactly the failures worth counting invisible.
+
+    `started_at` is THIS submit's time, reset on every attempt, because it is
+    the clock `orchestrator._fail_if_overdue` times the vendor task against.
+    It used to be `coalesce(started_at, now())` - the FIRST attempt's time,
+    kept across retries on the same row. Once provider 500s earned 12 attempts
+    over ~3.5 hours, a run past the 2h limit had its next render failed as
+    `VENDOR_TIMEOUT` on the first poll, seconds after submitting it, and that
+    failure is terminal. Two Batch 2 regenerations were lost that way on
+    2026-11-24, 25 seconds after their 9th submit.
     """
     execute(
         """
@@ -258,7 +267,7 @@ def mark_running(
                cost_usd = %(cost)s,
                billed_seconds = %(seconds)s,
                billed_units = %(units)s,
-               started_at = coalesce(started_at, now())
+               started_at = now()
          WHERE id = %(id)s;
         """,
         {
